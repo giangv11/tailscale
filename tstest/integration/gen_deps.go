@@ -16,7 +16,7 @@ import (
 )
 
 func main() {
-	for _, goos := range []string{"windows", "linux", "darwin", "freebsd", "openbsd"} {
+	for _, goos := range []string{"windows", "linux", "darwin", "freebsd", "openbsd", "netbsd"} {
 		generate(goos)
 	}
 }

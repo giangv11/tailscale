@@ -24,7 +24,7 @@ func statePath() string {
 	switch runtime.GOOS {
 	case "linux", "illumos", "solaris":
 		return "/var/lib/tailscale/tailscaled.state"
-	case "freebsd", "openbsd":
+	case "freebsd", "openbsd", "netbsd":
 		return "/var/db/tailscale/tailscaled.state"
 	case "darwin":
 		return "/Library/Tailscale/tailscaled.state"

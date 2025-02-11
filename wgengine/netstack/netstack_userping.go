@@ -49,6 +49,12 @@ func (ns *Impl) sendOutboundUserPing(dstIP netip.Addr, timeout time.Duration) er
 			ping = "ping6"
 		}
 		err = exec.Command(ping, "-c", "1", "-w", "3", dstIP.String()).Run()
+	case "netbsd":
+		ping := "ping"
+		if dstIP.Is6() {
+			ping = "ping6"
+		}
+		err = exec.Command(ping, "-c", "1", "-w", "3", dstIP.String()).Run()
 	case "android":
 		ping := "/system/bin/ping"
 		if dstIP.Is6() {

@@ -313,7 +313,7 @@ func winProgramDataAccessible(dir string) bool {
 // in / and $CACHE_DIRECTORY is deleted.
 func tryFixLogStateLocation(dir, cmdname string, logf logger.Logf) {
 	switch runtime.GOOS {
-	case "linux", "freebsd", "openbsd":
+	case "linux", "freebsd", "openbsd", "netbsd":
 		// These are the OSes where we might have written stuff into
 		// root. Others use different logic to find the logs storage
 		// dir.

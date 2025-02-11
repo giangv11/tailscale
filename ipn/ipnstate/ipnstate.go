@@ -648,6 +648,8 @@ func osEmoji(os string) string {
 		return "👿"
 	case "openbsd":
 		return "🐡"
+	case "netbsd":
+		return "NB"
 	case "illumos":
 		return "☀️"
 	case "solaris":

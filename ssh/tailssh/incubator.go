@@ -7,7 +7,7 @@
 // and groups to the specified `--uid`, `--gid` and `--groups`, and
 // then launches the requested `--cmd`.
 
-//go:build linux || (darwin && !ios) || freebsd || openbsd
+//go:build linux || (darwin && !ios) || freebsd || openbsd || netbsd
 
 package tailssh
 
@@ -48,6 +48,7 @@ const (
 	darwin  = "darwin"
 	freebsd = "freebsd"
 	openbsd = "openbsd"
+	netbsd  = "netbsd"
 )
 
 func init() {
@@ -441,7 +442,7 @@ func tryExecLogin(dlogf logger.Logf, ia incubatorArgs) error {
 	}
 
 	switch runtime.GOOS {
-	case linux, freebsd, openbsd:
+	case linux, freebsd, openbsd, netbsd:
 		if !ia.hasTTY {
 			dlogf("can't use login because of missing TTY")
 			// We can only use the login command if a shell was requested with
@@ -1088,7 +1089,7 @@ func (ia *incubatorArgs) loginArgs(loginCmdPath string) []string {
 			return []string{loginCmdPath, "-f", ia.localUser, "-p"}
 		}
 		return []string{loginCmdPath, "-f", ia.localUser, "-h", ia.remoteIP, "-p"}
-	case freebsd, openbsd:
+	case freebsd, openbsd, netbsd:
 		return []string{loginCmdPath, "-fp", "-h", ia.remoteIP, ia.localUser}
 	}
 	panic("unimplemented")
@@ -1096,7 +1097,7 @@ func (ia *incubatorArgs) loginArgs(loginCmdPath string) []string {
 
 func shellArgs(isShell bool, cmd string) []string {
 	if isShell {
-		if runtime.GOOS == freebsd || runtime.GOOS == openbsd {
+		if runtime.GOOS == freebsd || runtime.GOOS == openbsd || runtime.GOOS == netbsd {
 			// bsd shells don't support the "-l" option, so we can't run as a login shell
 			return []string{}
 		}

@@ -446,6 +446,10 @@ func findCmdTailscale() (string, error) {
 		if self == "/usr/local/bin/tailscaled" {
 			ts = "/usr/local/bin/tailscale"
 		}
+	case "netbsd":
+		if self == "/usr/pkg/bin/tailscaled" {
+			ts = "/usr/pkg/bin/tailscale"
+		}
 	default:
 		return "", fmt.Errorf("unsupported OS %v", runtime.GOOS)
 	}

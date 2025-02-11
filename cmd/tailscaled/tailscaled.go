@@ -74,7 +74,7 @@ import (
 // defaultTunName returns the default tun device name for the platform.
 func defaultTunName() string {
 	switch runtime.GOOS {
-	case "openbsd", "illumos", "solaris":
+	case "openbsd", "illumos", "solaris", "netbsd":
 		return "tun"
 	case "windows":
 		return "Tailscale"
@@ -666,7 +666,7 @@ func handleSubnetsInNetstack() bool {
 		return true
 	}
 	switch runtime.GOOS {
-	case "windows", "darwin", "freebsd", "openbsd", "solaris", "illumos":
+	case "windows", "darwin", "freebsd", "openbsd", "solaris", "illumos", "netbsd":
 		// Enable on Windows and tailscaled-on-macOS (this doesn't
 		// affect the GUI clients), and on FreeBSD.
 		return true

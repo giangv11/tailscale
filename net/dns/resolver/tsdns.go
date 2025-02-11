@@ -384,7 +384,7 @@ func (r *Resolver) HandlePeerDNSQuery(ctx context.Context, q []byte, from netip.
 		// but for now that's probably good enough. Later we'll
 		// want to blend in everything from scutil --dns.
 		fallthrough
-	case "linux", "freebsd", "openbsd", "illumos", "solaris", "ios":
+	case "linux", "freebsd", "openbsd", "illumos", "solaris", "ios", "netbsd":
 		nameserver, err := stubResolverForOS()
 		if err != nil {
 			r.logf("stubResolverForOS: %v", err)
