@@ -20,6 +20,7 @@ import (
 	"tailscale.com/util/syspolicy/rsop"
 	"tailscale.com/util/syspolicy/setting"
 	"tailscale.com/util/syspolicy/source"
+	"tailscale.com/util/testenv"
 )
 
 var (
@@ -46,7 +47,7 @@ func RegisterStore(name string, scope setting.PolicyScope, store source.Store) (
 }
 
 // MustRegisterStoreForTest is like [rsop.RegisterStoreForTest], but it fails the test if the store could not be registered.
-func MustRegisterStoreForTest(tb TB, name string, scope setting.PolicyScope, store source.Store) *rsop.StoreRegistration {
+func MustRegisterStoreForTest(tb testenv.TB, name string, scope setting.PolicyScope, store source.Store) *rsop.StoreRegistration {
 	tb.Helper()
 	reg, err := rsop.RegisterStoreForTest(tb, name, scope, store)
 	if err != nil {
@@ -87,6 +88,13 @@ func GetStringArray(key Key, defaultValue []string) ([]string, error) {
 // present or set to a different value, "user-decides" is the default.
 func GetPreferenceOption(name Key) (setting.PreferenceOption, error) {
 	return getCurrentPolicySettingValue(name, setting.ShowChoiceByPolicy)
+}
+
+// GetPreferenceOptionOrDefault is like [GetPreferenceOption], but allows
+// specifying a default value to return if the policy setting is not configured.
+// It can be used in situations where "user-decides" is not the default.
+func GetPreferenceOptionOrDefault(name Key, defaultValue setting.PreferenceOption) (setting.PreferenceOption, error) {
+	return getCurrentPolicySettingValue(name, defaultValue)
 }
 
 // GetVisibility loads a policy from the registry that can be managed

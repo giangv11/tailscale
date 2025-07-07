@@ -232,7 +232,7 @@ func (b *LocalBackend) updateServeTCPPortNetMapAddrListenersLocked(ports []uint1
 		}
 	}
 
-	nm := b.netMap
+	nm := b.NetMap()
 	if nm == nil {
 		b.logf("netMap is nil")
 		return
@@ -282,7 +282,7 @@ func (b *LocalBackend) setServeConfigLocked(config *ipn.ServeConfig, etag string
 		}
 	}
 
-	nm := b.netMap
+	nm := b.NetMap()
 	if nm == nil {
 		return errors.New("netMap is nil")
 	}
@@ -632,7 +632,7 @@ func (b *LocalBackend) getServeHandler(r *http.Request) (_ ipn.HTTPHandlerView, 
 
 	hostname := r.Host
 	if r.TLS == nil {
-		tcd := "." + b.Status().CurrentTailnet.MagicDNSSuffix
+		tcd := "." + b.CurrentProfile().NetworkProfile().MagicDNSName
 		if host, _, err := net.SplitHostPort(hostname); err == nil {
 			hostname = host
 		}

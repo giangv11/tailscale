@@ -5,9 +5,11 @@ package ipnlocal
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"net"
 	"net/http"
@@ -22,6 +24,8 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	memro "go4.org/mem"
 	"go4.org/netipx"
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/appc"
@@ -44,6 +48,7 @@ import (
 	"tailscale.com/tsd"
 	"tailscale.com/tstest"
 	"tailscale.com/types/dnstype"
+	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
@@ -60,6 +65,7 @@ import (
 	"tailscale.com/util/syspolicy/source"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
+	"tailscale.com/wgengine/filter/filtertype"
 	"tailscale.com/wgengine/wgcfg"
 )
 
@@ -72,6 +78,18 @@ func inRemove(ip netip.Addr) bool {
 		}
 	}
 	return false
+}
+
+func makeNodeKeyFromID(nodeID tailcfg.NodeID) key.NodePublic {
+	raw := make([]byte, 32)
+	binary.BigEndian.PutUint64(raw[24:], uint64(nodeID))
+	return key.NodePublicFromRaw32(memro.B(raw))
+}
+
+func makeDiscoKeyFromID(nodeID tailcfg.NodeID) (ret key.DiscoPublic) {
+	raw := make([]byte, 32)
+	binary.BigEndian.PutUint64(raw[24:], uint64(nodeID))
+	return key.DiscoPublicFromRaw32(memro.B(raw))
 }
 
 func TestShrinkDefaultRoute(t *testing.T) {
@@ -434,7 +452,7 @@ func (panicOnUseTransport) RoundTrip(*http.Request) (*http.Response, error) {
 }
 
 func newTestLocalBackend(t testing.TB) *LocalBackend {
-	return newTestLocalBackendWithSys(t, new(tsd.System))
+	return newTestLocalBackendWithSys(t, tsd.NewSystem())
 }
 
 // newTestLocalBackendWithSys creates a new LocalBackend with the given tsd.System.
@@ -446,7 +464,7 @@ func newTestLocalBackendWithSys(t testing.TB, sys *tsd.System) *LocalBackend {
 		sys.Set(new(mem.Store))
 	}
 	if _, ok := sys.Engine.GetOK(); !ok {
-		eng, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry())
+		eng, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry(), sys.Bus.Get())
 		if err != nil {
 			t.Fatalf("NewFakeUserspaceEngine: %v", err)
 		}
@@ -573,52 +591,389 @@ func TestSetUseExitNodeEnabled(t *testing.T) {
 	}
 }
 
-func TestFileTargets(t *testing.T) {
-	b := new(LocalBackend)
-	_, err := b.FileTargets()
-	if got, want := fmt.Sprint(err), "not connected to the tailnet"; got != want {
-		t.Errorf("before connect: got %q; want %q", got, want)
+func makeExitNode(id tailcfg.NodeID, opts ...peerOptFunc) tailcfg.NodeView {
+	return makePeer(id, append([]peerOptFunc{withCap(26), withSuggest(), withExitRoutes()}, opts...)...)
+}
+
+func TestConfigureExitNode(t *testing.T) {
+	controlURL := "https://localhost:1/"
+	exitNode1 := makeExitNode(1, withName("node-1"), withDERP(1), withAddresses(netip.MustParsePrefix("100.64.1.1/32")))
+	exitNode2 := makeExitNode(2, withName("node-2"), withDERP(2), withAddresses(netip.MustParsePrefix("100.64.1.2/32")))
+	selfNode := makeExitNode(3, withName("node-3"), withDERP(1), withAddresses(netip.MustParsePrefix("100.64.1.3/32")))
+	clientNetmap := buildNetmapWithPeers(selfNode, exitNode1, exitNode2)
+
+	report := &netcheck.Report{
+		RegionLatency: map[int]time.Duration{
+			1: 5 * time.Millisecond,
+			2: 10 * time.Millisecond,
+		},
+		PreferredDERP: 1,
 	}
 
-	b.netMap = new(netmap.NetworkMap)
-	_, err = b.FileTargets()
-	if got, want := fmt.Sprint(err), "not connected to the tailnet"; got != want {
-		t.Errorf("non-running netmap: got %q; want %q", got, want)
+	tests := []struct {
+		name               string
+		prefs              ipn.Prefs
+		netMap             *netmap.NetworkMap
+		report             *netcheck.Report
+		changePrefs        *ipn.MaskedPrefs
+		useExitNodeEnabled *bool
+		exitNodeIDPolicy   *tailcfg.StableNodeID
+		exitNodeIPPolicy   *netip.Addr
+		wantPrefs          ipn.Prefs
+	}{
+		{
+			name: "exit-node-id-via-prefs", // set exit node ID via prefs
+			prefs: ipn.Prefs{
+				ControlURL: controlURL,
+			},
+			netMap: clientNetmap,
+			report: report,
+			changePrefs: &ipn.MaskedPrefs{
+				Prefs:         ipn.Prefs{ExitNodeID: exitNode1.StableID()},
+				ExitNodeIDSet: true,
+			},
+			wantPrefs: ipn.Prefs{
+				ControlURL: controlURL,
+				ExitNodeID: exitNode1.StableID(),
+			},
+		},
+		{
+			name: "exit-node-ip-via-prefs", // set exit node IP via prefs (should be resolved to an ID)
+			prefs: ipn.Prefs{
+				ControlURL: controlURL,
+			},
+			netMap: clientNetmap,
+			report: report,
+			changePrefs: &ipn.MaskedPrefs{
+				Prefs:         ipn.Prefs{ExitNodeIP: exitNode1.Addresses().At(0).Addr()},
+				ExitNodeIPSet: true,
+			},
+			wantPrefs: ipn.Prefs{
+				ControlURL: controlURL,
+				ExitNodeID: exitNode1.StableID(),
+			},
+		},
+		{
+			name: "auto-exit-node-via-prefs/any", // set auto exit node via prefs
+			prefs: ipn.Prefs{
+				ControlURL: controlURL,
+			},
+			netMap: clientNetmap,
+			report: report,
+			changePrefs: &ipn.MaskedPrefs{
+				Prefs:           ipn.Prefs{AutoExitNode: "any"},
+				AutoExitNodeSet: true,
+			},
+			wantPrefs: ipn.Prefs{
+				ControlURL:   controlURL,
+				ExitNodeID:   exitNode1.StableID(),
+				AutoExitNode: "any",
+			},
+		},
+		{
+			name: "auto-exit-node-via-prefs/set-exit-node-id-via-prefs", // setting exit node ID explicitly should disable auto exit node
+			prefs: ipn.Prefs{
+				ControlURL:   controlURL,
+				AutoExitNode: "any",
+				ExitNodeID:   exitNode1.StableID(),
+			},
+			netMap: clientNetmap,
+			report: report,
+			changePrefs: &ipn.MaskedPrefs{
+				Prefs:         ipn.Prefs{ExitNodeID: exitNode2.StableID()},
+				ExitNodeIDSet: true,
+			},
+			wantPrefs: ipn.Prefs{
+				ControlURL:   controlURL,
+				ExitNodeID:   exitNode2.StableID(),
+				AutoExitNode: "", // should be unset
+			},
+		},
+		{
+			name: "auto-exit-node-via-prefs/any/no-report", // set auto exit node via prefs, but no report means we can't resolve the exit node ID
+			prefs: ipn.Prefs{
+				ControlURL: controlURL,
+			},
+			netMap: clientNetmap,
+			changePrefs: &ipn.MaskedPrefs{
+				Prefs:           ipn.Prefs{AutoExitNode: "any"},
+				AutoExitNodeSet: true,
+			},
+			wantPrefs: ipn.Prefs{
+				ControlURL:   controlURL,
+				ExitNodeID:   unresolvedExitNodeID, // cannot resolve; traffic will be dropped
+				AutoExitNode: "any",
+			},
+		},
+		{
+			name: "auto-exit-node-via-prefs/any/no-netmap", // similarly, but without a netmap (no exit node should be selected)
+			prefs: ipn.Prefs{
+				ControlURL: controlURL,
+			},
+			report: report,
+			changePrefs: &ipn.MaskedPrefs{
+				Prefs:           ipn.Prefs{AutoExitNode: "any"},
+				AutoExitNodeSet: true,
+			},
+			wantPrefs: ipn.Prefs{
+				ControlURL:   controlURL,
+				ExitNodeID:   unresolvedExitNodeID, // cannot resolve; traffic will be dropped
+				AutoExitNode: "any",
+			},
+		},
+		{
+			name: "auto-exit-node-via-prefs/foo", // set auto exit node via prefs with an unknown/unsupported expression
+			prefs: ipn.Prefs{
+				ControlURL: controlURL,
+			},
+			netMap: clientNetmap,
+			report: report,
+			changePrefs: &ipn.MaskedPrefs{
+				Prefs:           ipn.Prefs{AutoExitNode: "foo"},
+				AutoExitNodeSet: true,
+			},
+			wantPrefs: ipn.Prefs{
+				ControlURL:   controlURL,
+				ExitNodeID:   exitNode1.StableID(), // unknown exit node expressions should work as "any"
+				AutoExitNode: "foo",
+			},
+		},
+		{
+			name: "auto-exit-node-via-prefs/off", // toggle the exit node off after it was set to "any"
+			prefs: ipn.Prefs{
+				ControlURL: controlURL,
+			},
+			netMap: clientNetmap,
+			report: report,
+			changePrefs: &ipn.MaskedPrefs{
+				Prefs:           ipn.Prefs{AutoExitNode: "any"},
+				AutoExitNodeSet: true,
+			},
+			useExitNodeEnabled: ptr.To(false),
+			wantPrefs: ipn.Prefs{
+				ControlURL:            controlURL,
+				ExitNodeID:            "",
+				AutoExitNode:          "",
+				InternalExitNodePrior: "auto:any",
+			},
+		},
+		{
+			name: "auto-exit-node-via-prefs/on", // toggle the exit node on
+			prefs: ipn.Prefs{
+				ControlURL:            controlURL,
+				InternalExitNodePrior: "auto:any",
+			},
+			netMap:             clientNetmap,
+			report:             report,
+			useExitNodeEnabled: ptr.To(true),
+			wantPrefs: ipn.Prefs{
+				ControlURL:            controlURL,
+				ExitNodeID:            exitNode1.StableID(),
+				AutoExitNode:          "any",
+				InternalExitNodePrior: "auto:any",
+			},
+		},
+		{
+			name: "id-via-policy", // set exit node ID via syspolicy
+			prefs: ipn.Prefs{
+				ControlURL: controlURL,
+			},
+			netMap:           clientNetmap,
+			exitNodeIDPolicy: ptr.To(exitNode1.StableID()),
+			wantPrefs: ipn.Prefs{
+				ControlURL: controlURL,
+				ExitNodeID: exitNode1.StableID(),
+			},
+		},
+		{
+			name: "id-via-policy/cannot-override-via-prefs/by-id", // syspolicy should take precedence over prefs
+			prefs: ipn.Prefs{
+				ControlURL: controlURL,
+			},
+			netMap:           clientNetmap,
+			exitNodeIDPolicy: ptr.To(exitNode1.StableID()),
+			changePrefs: &ipn.MaskedPrefs{
+				Prefs: ipn.Prefs{
+					ExitNodeID: exitNode2.StableID(), // this should be ignored
+				},
+				ExitNodeIDSet: true,
+			},
+			wantPrefs: ipn.Prefs{
+				ControlURL: controlURL,
+				ExitNodeID: exitNode1.StableID(),
+			},
+		},
+		{
+			name: "id-via-policy/cannot-override-via-prefs/by-ip", // syspolicy should take precedence over prefs
+			prefs: ipn.Prefs{
+				ControlURL: controlURL,
+			},
+			netMap:           clientNetmap,
+			exitNodeIDPolicy: ptr.To(exitNode1.StableID()),
+			changePrefs: &ipn.MaskedPrefs{
+				Prefs: ipn.Prefs{
+					ExitNodeIP: exitNode2.Addresses().At(0).Addr(), // this should be ignored
+				},
+				ExitNodeIPSet: true,
+			},
+			wantPrefs: ipn.Prefs{
+				ControlURL: controlURL,
+				ExitNodeID: exitNode1.StableID(),
+			},
+		},
+		{
+			name: "id-via-policy/cannot-override-via-prefs/by-auto-expr", // syspolicy should take precedence over prefs
+			prefs: ipn.Prefs{
+				ControlURL: controlURL,
+			},
+			netMap:           clientNetmap,
+			exitNodeIDPolicy: ptr.To(exitNode1.StableID()),
+			changePrefs: &ipn.MaskedPrefs{
+				Prefs: ipn.Prefs{
+					AutoExitNode: "any", // this should be ignored
+				},
+				AutoExitNodeSet: true,
+			},
+			wantPrefs: ipn.Prefs{
+				ControlURL: controlURL,
+				ExitNodeID: exitNode1.StableID(),
+			},
+		},
+		{
+			name: "ip-via-policy", // set exit node IP via syspolicy (should be resolved to an ID)
+			prefs: ipn.Prefs{
+				ControlURL: controlURL,
+			},
+			netMap:           clientNetmap,
+			exitNodeIPPolicy: ptr.To(exitNode2.Addresses().At(0).Addr()),
+			wantPrefs: ipn.Prefs{
+				ControlURL: controlURL,
+				ExitNodeID: exitNode2.StableID(),
+			},
+		},
+		{
+			name: "auto-any-via-policy", // set auto exit node via syspolicy (an exit node should be selected)
+			prefs: ipn.Prefs{
+				ControlURL: controlURL,
+			},
+			netMap:           clientNetmap,
+			report:           report,
+			exitNodeIDPolicy: ptr.To(tailcfg.StableNodeID("auto:any")),
+			wantPrefs: ipn.Prefs{
+				ControlURL:   controlURL,
+				ExitNodeID:   exitNode1.StableID(),
+				AutoExitNode: "any",
+			},
+		},
+		{
+			name: "auto-any-via-policy/no-report", // set auto exit node via syspolicy without a netcheck report (no exit node should be selected)
+			prefs: ipn.Prefs{
+				ControlURL: controlURL,
+			},
+			netMap:           clientNetmap,
+			report:           nil,
+			exitNodeIDPolicy: ptr.To(tailcfg.StableNodeID("auto:any")),
+			wantPrefs: ipn.Prefs{
+				ControlURL:   controlURL,
+				ExitNodeID:   unresolvedExitNodeID,
+				AutoExitNode: "any",
+			},
+		},
+		{
+			name: "auto-any-via-policy/no-netmap", // similarly, but without a netmap (no exit node should be selected)
+			prefs: ipn.Prefs{
+				ControlURL: controlURL,
+			},
+			netMap:           nil,
+			report:           report,
+			exitNodeIDPolicy: ptr.To(tailcfg.StableNodeID("auto:any")),
+			wantPrefs: ipn.Prefs{
+				ControlURL:   controlURL,
+				ExitNodeID:   unresolvedExitNodeID,
+				AutoExitNode: "any",
+			},
+		},
+		{
+			name: "auto-foo-via-policy", // set auto exit node via syspolicy with an unknown/unsupported expression
+			prefs: ipn.Prefs{
+				ControlURL: controlURL,
+			},
+			netMap:           clientNetmap,
+			report:           report,
+			exitNodeIDPolicy: ptr.To(tailcfg.StableNodeID("auto:foo")),
+			wantPrefs: ipn.Prefs{
+				ControlURL:   controlURL,
+				ExitNodeID:   exitNode1.StableID(), // unknown exit node expressions should work as "any"
+				AutoExitNode: "foo",
+			},
+		},
+		{
+			name: "auto-any-via-policy/toggle-off", // cannot toggle off the exit node if it was set via syspolicy
+			prefs: ipn.Prefs{
+				ControlURL: controlURL,
+			},
+			netMap:             clientNetmap,
+			report:             report,
+			exitNodeIDPolicy:   ptr.To(tailcfg.StableNodeID("auto:any")),
+			useExitNodeEnabled: ptr.To(false), // should be ignored
+			wantPrefs: ipn.Prefs{
+				ControlURL:            controlURL,
+				ExitNodeID:            exitNode1.StableID(), // still enforced by the policy setting
+				AutoExitNode:          "any",
+				InternalExitNodePrior: "auto:any",
+			},
+		},
 	}
+	syspolicy.RegisterWellKnownSettingsForTest(t)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Configure policy settings, if any.
+			var settings []source.TestSetting[string]
+			if tt.exitNodeIDPolicy != nil {
+				settings = append(settings, source.TestSettingOf(syspolicy.ExitNodeID, string(*tt.exitNodeIDPolicy)))
+			}
+			if tt.exitNodeIPPolicy != nil {
+				settings = append(settings, source.TestSettingOf(syspolicy.ExitNodeIP, tt.exitNodeIPPolicy.String()))
+			}
+			if settings != nil {
+				syspolicy.MustRegisterStoreForTest(t, "TestStore", setting.DeviceScope, source.NewTestStoreOf(t, settings...))
+			} else {
+				// No syspolicy settings, so don't register a store.
+				// This allows the test to run in parallel with other tests.
+				t.Parallel()
+			}
 
-	b.state = ipn.Running
-	_, err = b.FileTargets()
-	if got, want := fmt.Sprint(err), "file sharing not enabled by Tailscale admin"; got != want {
-		t.Errorf("without cap: got %q; want %q", got, want)
-	}
+			// Create a new LocalBackend with the given prefs.
+			// Any syspolicy settings will be applied to the initial prefs.
+			lb := newTestLocalBackend(t)
+			lb.SetPrefsForTest(tt.prefs.Clone())
+			// Then set the netcheck report and netmap, if any.
+			if tt.report != nil {
+				lb.MagicConn().SetLastNetcheckReportForTest(t.Context(), tt.report)
+			}
+			if tt.netMap != nil {
+				lb.SetControlClientStatus(lb.cc, controlclient.Status{NetMap: tt.netMap})
+			}
 
-	b.capFileSharing = true
-	got, err := b.FileTargets()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 0 {
-		t.Fatalf("unexpected %d peers", len(got))
-	}
+			// If we have a changePrefs, apply it.
+			if tt.changePrefs != nil {
+				lb.EditPrefs(tt.changePrefs)
+			}
 
-	var peerMap map[tailcfg.NodeID]tailcfg.NodeView
-	mak.NonNil(&peerMap)
-	var nodeID tailcfg.NodeID
-	nodeID = 1234
-	peer := &tailcfg.Node{
-		ID:       1234,
-		Hostinfo: (&tailcfg.Hostinfo{OS: "tvOS"}).View(),
+			// If we need to flip exit node toggle on or off, do it.
+			if tt.useExitNodeEnabled != nil {
+				lb.SetUseExitNodeEnabled(*tt.useExitNodeEnabled)
+			}
+
+			// Now check the prefs.
+			opts := []cmp.Option{
+				cmpopts.EquateComparable(netip.Addr{}, netip.Prefix{}),
+			}
+			if diff := cmp.Diff(&tt.wantPrefs, lb.Prefs().AsStruct(), opts...); diff != "" {
+				t.Errorf("Prefs(+got -want): %v", diff)
+			}
+		})
 	}
-	peerMap[nodeID] = peer.View()
-	b.peers = peerMap
-	got, err = b.FileTargets()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 0 {
-		t.Fatalf("unexpected %d peers", len(got))
-	}
-	// (other cases handled by TestPeerAPIBase above)
 }
 
 func TestInternalAndExternalInterfaces(t *testing.T) {
@@ -839,6 +1194,7 @@ func TestStatusPeerCapabilities(t *testing.T) {
 				(&tailcfg.Node{
 					ID:              1,
 					StableID:        "foo",
+					Key:             makeNodeKeyFromID(1),
 					IsWireGuardOnly: true,
 					Hostinfo:        (&tailcfg.Hostinfo{}).View(),
 					Capabilities:    []tailcfg.NodeCapability{tailcfg.CapabilitySSH},
@@ -849,16 +1205,28 @@ func TestStatusPeerCapabilities(t *testing.T) {
 				(&tailcfg.Node{
 					ID:           2,
 					StableID:     "bar",
+					Key:          makeNodeKeyFromID(2),
 					Hostinfo:     (&tailcfg.Hostinfo{}).View(),
 					Capabilities: []tailcfg.NodeCapability{tailcfg.CapabilityAdmin},
 					CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
 						tailcfg.CapabilityAdmin: {`{"test": "true}`},
 					}),
 				}).View(),
+				(&tailcfg.Node{
+					ID:           3,
+					StableID:     "baz",
+					Key:          makeNodeKeyFromID(3),
+					Hostinfo:     (&tailcfg.Hostinfo{}).View(),
+					Capabilities: []tailcfg.NodeCapability{tailcfg.CapabilityOwner},
+					CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+						tailcfg.CapabilityOwner: nil,
+					}),
+				}).View(),
 			},
 			expectedPeerCapabilities: map[tailcfg.StableNodeID][]tailcfg.NodeCapability{
 				tailcfg.StableNodeID("foo"): {tailcfg.CapabilitySSH},
 				tailcfg.StableNodeID("bar"): {tailcfg.CapabilityAdmin},
+				tailcfg.StableNodeID("baz"): {tailcfg.CapabilityOwner},
 			},
 			expectedPeerCapMap: map[tailcfg.StableNodeID]tailcfg.NodeCapMap{
 				tailcfg.StableNodeID("foo"): (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
@@ -866,6 +1234,9 @@ func TestStatusPeerCapabilities(t *testing.T) {
 				}),
 				tailcfg.StableNodeID("bar"): (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
 					tailcfg.CapabilityAdmin: {`{"test": "true}`},
+				}),
+				tailcfg.StableNodeID("baz"): (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+					tailcfg.CapabilityOwner: nil,
 				}),
 			},
 		},
@@ -875,12 +1246,14 @@ func TestStatusPeerCapabilities(t *testing.T) {
 				(&tailcfg.Node{
 					ID:              1,
 					StableID:        "foo",
+					Key:             makeNodeKeyFromID(1),
 					IsWireGuardOnly: true,
 					Hostinfo:        (&tailcfg.Hostinfo{}).View(),
 				}).View(),
 				(&tailcfg.Node{
 					ID:       2,
 					StableID: "bar",
+					Key:      makeNodeKeyFromID(2),
 					Hostinfo: (&tailcfg.Hostinfo{}).View(),
 				}).View(),
 			},
@@ -966,15 +1339,19 @@ func TestWatchNotificationsCallbacks(t *testing.T) {
 // tests LocalBackend.updateNetmapDeltaLocked
 func TestUpdateNetmapDelta(t *testing.T) {
 	b := newTestLocalBackend(t)
-	if b.updateNetmapDeltaLocked(nil) {
+	if b.currentNode().UpdateNetmapDelta(nil) {
 		t.Errorf("updateNetmapDeltaLocked() = true, want false with nil netmap")
 	}
 
-	b.netMap = &netmap.NetworkMap{}
+	nm := &netmap.NetworkMap{}
 	for i := range 5 {
-		b.netMap.Peers = append(b.netMap.Peers, (&tailcfg.Node{ID: (tailcfg.NodeID(i) + 1)}).View())
+		id := tailcfg.NodeID(i + 1)
+		nm.Peers = append(nm.Peers, (&tailcfg.Node{
+			ID:  id,
+			Key: makeNodeKeyFromID(id),
+		}).View())
 	}
-	b.updatePeersFromNetmapLocked(b.netMap)
+	b.currentNode().SetNetMap(nm)
 
 	someTime := time.Unix(123, 0)
 	muts, ok := netmap.MutationsFromMapResponse(&tailcfg.MapResponse{
@@ -1001,32 +1378,36 @@ func TestUpdateNetmapDelta(t *testing.T) {
 		t.Fatal("netmap.MutationsFromMapResponse failed")
 	}
 
-	if !b.updateNetmapDeltaLocked(muts) {
+	if !b.currentNode().UpdateNetmapDelta(muts) {
 		t.Fatalf("updateNetmapDeltaLocked() = false, want true with new netmap")
 	}
 
 	wants := []*tailcfg.Node{
 		{
 			ID:       1,
+			Key:      makeNodeKeyFromID(1),
 			HomeDERP: 1,
 		},
 		{
 			ID:     2,
+			Key:    makeNodeKeyFromID(2),
 			Online: ptr.To(true),
 		},
 		{
 			ID:     3,
+			Key:    makeNodeKeyFromID(3),
 			Online: ptr.To(false),
 		},
 		{
 			ID:       4,
+			Key:      makeNodeKeyFromID(4),
 			LastSeen: ptr.To(someTime),
 		},
 	}
 	for _, want := range wants {
-		gotv, ok := b.peers[want.ID]
+		gotv, ok := b.currentNode().NodeByID(want.ID)
 		if !ok {
-			t.Errorf("netmap.Peer %v missing from b.peers", want.ID)
+			t.Errorf("netmap.Peer %v missing from b.profile.Peers", want.ID)
 			continue
 		}
 		got := gotv.AsStruct()
@@ -1043,22 +1424,24 @@ func TestWhoIs(t *testing.T) {
 		SelfNode: (&tailcfg.Node{
 			ID:        1,
 			User:      10,
+			Key:       makeNodeKeyFromID(1),
 			Addresses: []netip.Prefix{netip.MustParsePrefix("100.101.102.103/32")},
 		}).View(),
 		Peers: []tailcfg.NodeView{
 			(&tailcfg.Node{
 				ID:        2,
 				User:      20,
+				Key:       makeNodeKeyFromID(2),
 				Addresses: []netip.Prefix{netip.MustParsePrefix("100.200.200.200/32")},
 			}).View(),
 		},
-		UserProfiles: map[tailcfg.UserID]tailcfg.UserProfile{
-			10: {
+		UserProfiles: map[tailcfg.UserID]tailcfg.UserProfileView{
+			10: (&tailcfg.UserProfile{
 				DisplayName: "Myself",
-			},
-			20: {
+			}).View(),
+			20: (&tailcfg.UserProfile{
 				DisplayName: "Peer",
-			},
+			}).View(),
 		},
 	})
 	tests := []struct {
@@ -1444,7 +1827,7 @@ func TestCoveredRouteRangeNoDefault(t *testing.T) {
 
 func TestReconfigureAppConnector(t *testing.T) {
 	b := newTestBackend(t)
-	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
 	if b.appConnector != nil {
 		t.Fatal("unexpected app connector")
 	}
@@ -1457,7 +1840,7 @@ func TestReconfigureAppConnector(t *testing.T) {
 		},
 		AppConnectorSet: true,
 	})
-	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
 	if b.appConnector == nil {
 		t.Fatal("expected app connector")
 	}
@@ -1468,15 +1851,19 @@ func TestReconfigureAppConnector(t *testing.T) {
 		"connectors": ["tag:example"]
 	}`
 
-	b.netMap.SelfNode = (&tailcfg.Node{
-		Name: "example.ts.net",
-		Tags: []string{"tag:example"},
-		CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
-			"tailscale.com/app-connectors": {tailcfg.RawMessage(appCfg)},
-		}),
-	}).View()
+	nm := &netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{
+			Name: "example.ts.net",
+			Tags: []string{"tag:example"},
+			CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+				"tailscale.com/app-connectors": {tailcfg.RawMessage(appCfg)},
+			}),
+		}).View(),
+	}
 
-	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+	b.currentNode().SetNetMap(nm)
+
+	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
 	b.appConnector.Wait(context.Background())
 
 	want := []string{"example.com"}
@@ -1496,7 +1883,7 @@ func TestReconfigureAppConnector(t *testing.T) {
 		},
 		AppConnectorSet: true,
 	})
-	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
 	if b.appConnector != nil {
 		t.Fatal("expected no app connector")
 	}
@@ -1508,6 +1895,15 @@ func TestReconfigureAppConnector(t *testing.T) {
 func TestBackfillAppConnectorRoutes(t *testing.T) {
 	// Create backend with an empty app connector.
 	b := newTestBackend(t)
+	// newTestBackend creates a backend with a non-nil netmap,
+	// but this test requires a nil netmap.
+	// Otherwise, instead of backfilling, [LocalBackend.reconfigAppConnectorLocked]
+	// uses the domains and routes from netmap's [appctype.AppConnectorAttr].
+	// Additionally, a non-nil netmap makes reconfigAppConnectorLocked
+	// asynchronous, resulting in a flaky test.
+	// Therefore, we set the netmap to nil to simulate a fresh backend start
+	// or a profile switch where the netmap is not yet available.
+	b.setNetMapLocked(nil)
 	if err := b.Start(ipn.Options{}); err != nil {
 		t.Fatal(err)
 	}
@@ -1519,7 +1915,7 @@ func TestBackfillAppConnectorRoutes(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
 
 	// Smoke check that AdvertiseRoutes doesn't have the test IP.
 	ip := netip.MustParseAddr("1.2.3.4")
@@ -1540,7 +1936,7 @@ func TestBackfillAppConnectorRoutes(t *testing.T) {
 
 	// Mimic b.authReconfigure for the app connector bits.
 	b.mu.Lock()
-	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
 	b.mu.Unlock()
 	b.readvertiseAppConnectorRoutes()
 
@@ -1625,6 +2021,7 @@ func dnsResponse(domain, address string) []byte {
 }
 
 func TestSetExitNodeIDPolicy(t *testing.T) {
+	zeroValHostinfoView := new(tailcfg.Hostinfo).View()
 	pfx := netip.MustParsePrefix
 	tests := []struct {
 		name                  string
@@ -1635,6 +2032,7 @@ func TestSetExitNodeIDPolicy(t *testing.T) {
 		prefs                 *ipn.Prefs
 		exitNodeIPWant        string
 		exitNodeIDWant        string
+		autoExitNodeWant      ipn.ExitNodeExpression
 		prefsChanged          bool
 		nm                    *netmap.NetworkMap
 		lastSuggestedExitNode tailcfg.StableNodeID
@@ -1701,14 +2099,18 @@ func TestSetExitNodeIDPolicy(t *testing.T) {
 				}).View(),
 				Peers: []tailcfg.NodeView{
 					(&tailcfg.Node{
+						ID:   201,
 						Name: "a.tailnet",
+						Key:  makeNodeKeyFromID(201),
 						Addresses: []netip.Prefix{
 							pfx("100.0.0.201/32"),
 							pfx("100::201/128"),
 						},
 					}).View(),
 					(&tailcfg.Node{
+						ID:   202,
 						Name: "b.tailnet",
+						Key:  makeNodeKeyFromID(202),
 						Addresses: []netip.Prefix{
 							pfx("100::202/128"),
 						},
@@ -1734,18 +2136,24 @@ func TestSetExitNodeIDPolicy(t *testing.T) {
 				}).View(),
 				Peers: []tailcfg.NodeView{
 					(&tailcfg.Node{
+						ID:       123,
 						Name:     "a.tailnet",
 						StableID: tailcfg.StableNodeID("123"),
+						Key:      makeNodeKeyFromID(123),
 						Addresses: []netip.Prefix{
 							pfx("127.0.0.1/32"),
 							pfx("100::201/128"),
 						},
+						Hostinfo: zeroValHostinfoView,
 					}).View(),
 					(&tailcfg.Node{
+						ID:   202,
 						Name: "b.tailnet",
+						Key:  makeNodeKeyFromID(202),
 						Addresses: []netip.Prefix{
 							pfx("100::202/128"),
 						},
+						Hostinfo: zeroValHostinfoView,
 					}).View(),
 				},
 			},
@@ -1766,18 +2174,24 @@ func TestSetExitNodeIDPolicy(t *testing.T) {
 				}).View(),
 				Peers: []tailcfg.NodeView{
 					(&tailcfg.Node{
+						ID:       123,
 						Name:     "a.tailnet",
 						StableID: tailcfg.StableNodeID("123"),
+						Key:      makeNodeKeyFromID(123),
 						Addresses: []netip.Prefix{
 							pfx("127.0.0.1/32"),
 							pfx("100::201/128"),
 						},
+						Hostinfo: zeroValHostinfoView,
 					}).View(),
 					(&tailcfg.Node{
+						ID:   202,
 						Name: "b.tailnet",
+						Key:  makeNodeKeyFromID(202),
 						Addresses: []netip.Prefix{
 							pfx("100::202/128"),
 						},
+						Hostinfo: zeroValHostinfoView,
 					}).View(),
 				},
 			},
@@ -1800,36 +2214,61 @@ func TestSetExitNodeIDPolicy(t *testing.T) {
 				}).View(),
 				Peers: []tailcfg.NodeView{
 					(&tailcfg.Node{
+						ID:       123,
 						Name:     "a.tailnet",
 						StableID: tailcfg.StableNodeID("123"),
+						Key:      makeNodeKeyFromID(123),
 						Addresses: []netip.Prefix{
 							pfx("100.64.5.6/32"),
 							pfx("100::201/128"),
 						},
+						Hostinfo: zeroValHostinfoView,
 					}).View(),
 					(&tailcfg.Node{
+						ID:   202,
 						Name: "b.tailnet",
+						Key:  makeNodeKeyFromID(202),
 						Addresses: []netip.Prefix{
 							pfx("100::202/128"),
 						},
+						Hostinfo: zeroValHostinfoView,
 					}).View(),
 				},
 			},
 		},
 		{
-			name:                  "ExitNodeID key is set to auto and last suggested exit node is populated",
+			name:                  "ExitNodeID key is set to auto:any and last suggested exit node is populated",
 			exitNodeIDKey:         true,
 			exitNodeID:            "auto:any",
 			lastSuggestedExitNode: "123",
 			exitNodeIDWant:        "123",
+			autoExitNodeWant:      "any",
 			prefsChanged:          true,
 		},
 		{
-			name:           "ExitNodeID key is set to auto and last suggested exit node is not populated",
-			exitNodeIDKey:  true,
-			exitNodeID:     "auto:any",
-			prefsChanged:   true,
-			exitNodeIDWant: "auto:any",
+			name:             "ExitNodeID key is set to auto:any and last suggested exit node is not populated",
+			exitNodeIDKey:    true,
+			exitNodeID:       "auto:any",
+			exitNodeIDWant:   "auto:any",
+			autoExitNodeWant: "any",
+			prefsChanged:     true,
+		},
+		{
+			name:                  "ExitNodeID key is set to auto:foo and last suggested exit node is populated",
+			exitNodeIDKey:         true,
+			exitNodeID:            "auto:foo",
+			lastSuggestedExitNode: "123",
+			exitNodeIDWant:        "123",
+			autoExitNodeWant:      "foo",
+			prefsChanged:          true,
+		},
+		{
+			name:             "ExitNodeID key is set to auto:foo and last suggested exit node is not populated",
+			exitNodeIDKey:    true,
+			exitNodeID:       "auto:foo",
+			exitNodeIDWant:   "auto:any", // should be "auto:any" for compatibility with existing clients
+			autoExitNodeWant: "foo",
+			prefsChanged:     true,
 		},
 	}
 
@@ -1856,12 +2295,11 @@ func TestSetExitNodeIDPolicy(t *testing.T) {
 			}
 			pm := must.Get(newProfileManager(new(mem.Store), t.Logf, new(health.Tracker)))
 			pm.prefs = test.prefs.View()
-			b.netMap = test.nm
+			b.currentNode().SetNetMap(test.nm)
 			b.pm = pm
 			b.lastSuggestedExitNode = test.lastSuggestedExitNode
-
 			prefs := b.pm.prefs.AsStruct()
-			if changed := applySysPolicy(prefs, test.lastSuggestedExitNode, false) || setExitNodeID(prefs, test.nm); changed != test.prefsChanged {
+			if changed := applySysPolicy(prefs, false) || setExitNodeID(prefs, test.lastSuggestedExitNode, test.nm); changed != test.prefsChanged {
 				t.Errorf("wanted prefs changed %v, got prefs changed %v", test.prefsChanged, changed)
 			}
 
@@ -1871,23 +2309,28 @@ func TestSetExitNodeIDPolicy(t *testing.T) {
 			// preferences to change.
 			b.SetPrefsForTest(pm.CurrentPrefs().AsStruct())
 
-			if got := b.pm.prefs.ExitNodeID(); got != tailcfg.StableNodeID(test.exitNodeIDWant) {
-				t.Errorf("got %v want %v", got, test.exitNodeIDWant)
+			if got := b.Prefs().ExitNodeID(); got != tailcfg.StableNodeID(test.exitNodeIDWant) {
+				t.Errorf("ExitNodeID: got %q; want %q", got, test.exitNodeIDWant)
 			}
-			if got := b.pm.prefs.ExitNodeIP(); test.exitNodeIPWant == "" {
+			if got := b.Prefs().ExitNodeIP(); test.exitNodeIPWant == "" {
 				if got.String() != "invalid IP" {
-					t.Errorf("got %v want invalid IP", got)
+					t.Errorf("ExitNodeIP: got %v want invalid IP", got)
 				}
 			} else if got.String() != test.exitNodeIPWant {
-				t.Errorf("got %v want %v", got, test.exitNodeIPWant)
+				t.Errorf("ExitNodeIP: got %q; want %q", got, test.exitNodeIPWant)
+			}
+			if got := b.Prefs().AutoExitNode(); got != test.autoExitNodeWant {
+				t.Errorf("AutoExitNode: got %q; want %q", got, test.autoExitNodeWant)
 			}
 		})
 	}
 }
 
 func TestUpdateNetmapDeltaAutoExitNode(t *testing.T) {
-	peer1 := makePeer(1, withCap(26), withSuggest(), withExitRoutes())
-	peer2 := makePeer(2, withCap(26), withSuggest(), withExitRoutes())
+	t.Skip("TODO(tailscale/tailscale#16455): suggestExitNode does not check for online status of exit nodes")
+
+	peer1 := makePeer(1, withCap(26), withSuggest(), withOnline(true), withExitRoutes())
+	peer2 := makePeer(2, withCap(26), withSuggest(), withOnline(true), withExitRoutes())
 	derpMap := &tailcfg.DERPMap{
 		Regions: map[int]*tailcfg.DERPRegion{
 			1: {
@@ -1926,8 +2369,10 @@ func TestUpdateNetmapDeltaAutoExitNode(t *testing.T) {
 	}{
 		{
 			// selected auto exit node goes offline
-			name:                  "exit-node-goes-offline",
-			lastSuggestedExitNode: peer1.StableID(),
+			name: "exit-node-goes-offline",
+			// PreferredDERP is 2, and it's also the region with the lowest latency.
+			// So, peer2 should be selected as the exit node.
+			lastSuggestedExitNode: peer2.StableID(),
 			netmap: &netmap.NetworkMap{
 				Peers: []tailcfg.NodeView{
 					peer1,
@@ -1938,14 +2383,14 @@ func TestUpdateNetmapDeltaAutoExitNode(t *testing.T) {
 			muts: []*tailcfg.PeerChange{
 				{
 					NodeID: 1,
-					Online: ptr.To(false),
+					Online: ptr.To(true),
 				},
 				{
 					NodeID: 2,
-					Online: ptr.To(true),
+					Online: ptr.To(false), // the selected exit node goes offline
 				},
 			},
-			exitNodeIDWant: peer2.StableID(),
+			exitNodeIDWant: peer1.StableID(),
 			report:         report,
 		},
 		{
@@ -1962,7 +2407,7 @@ func TestUpdateNetmapDeltaAutoExitNode(t *testing.T) {
 			muts: []*tailcfg.PeerChange{
 				{
 					NodeID: 1,
-					Online: ptr.To(false),
+					Online: ptr.To(false), // a different exit node goes offline
 				},
 				{
 					NodeID: 2,
@@ -1983,8 +2428,7 @@ func TestUpdateNetmapDeltaAutoExitNode(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			b := newTestLocalBackend(t)
-			b.netMap = tt.netmap
-			b.updatePeersFromNetmapLocked(b.netMap)
+			b.currentNode().SetNetMap(tt.netmap)
 			b.lastSuggestedExitNode = tt.lastSuggestedExitNode
 			b.sys.MagicSock.Get().SetLastNetcheckReportForTest(b.ctx, tt.report)
 			b.SetPrefsForTest(b.pm.CurrentPrefs().AsStruct())
@@ -2102,14 +2546,14 @@ func TestAutoExitNodeSetNetInfoCallback(t *testing.T) {
 			},
 		},
 	}
-	b.netMap = &netmap.NetworkMap{
+	b.currentNode().SetNetMap(&netmap.NetworkMap{
 		SelfNode: selfNode.View(),
 		Peers: []tailcfg.NodeView{
 			peer1,
 			peer2,
 		},
 		DERPMap: defaultDERPMap,
-	}
+	})
 	b.lastSuggestedExitNode = peer1.StableID()
 	b.SetPrefsForTest(b.pm.CurrentPrefs().AsStruct())
 	if eid := b.Prefs().ExitNodeID(); eid != peer1.StableID() {
@@ -2131,8 +2575,8 @@ func TestAutoExitNodeSetNetInfoCallback(t *testing.T) {
 }
 
 func TestSetControlClientStatusAutoExitNode(t *testing.T) {
-	peer1 := makePeer(1, withCap(26), withSuggest(), withExitRoutes(), withNodeKey())
-	peer2 := makePeer(2, withCap(26), withSuggest(), withExitRoutes(), withNodeKey())
+	peer1 := makePeer(1, withCap(26), withSuggest(), withExitRoutes(), withOnline(true), withNodeKey())
+	peer2 := makePeer(2, withCap(26), withSuggest(), withExitRoutes(), withOnline(true), withNodeKey())
 	derpMap := &tailcfg.DERPMap{
 		Regions: map[int]*tailcfg.DERPRegion{
 			1: {
@@ -2174,23 +2618,26 @@ func TestSetControlClientStatusAutoExitNode(t *testing.T) {
 		syspolicy.ExitNodeID, "auto:any",
 	))
 	syspolicy.MustRegisterStoreForTest(t, "TestStore", setting.DeviceScope, policyStore)
-	b.netMap = nm
-	b.lastSuggestedExitNode = peer1.StableID()
+	b.currentNode().SetNetMap(nm)
+	// Peer 2 should be the initial exit node, as it's better than peer 1
+	// in terms of latency and DERP region.
+	b.lastSuggestedExitNode = peer2.StableID()
 	b.sys.MagicSock.Get().SetLastNetcheckReportForTest(b.ctx, report)
 	b.SetPrefsForTest(b.pm.CurrentPrefs().AsStruct())
-	firstExitNode := b.Prefs().ExitNodeID()
-	newPeer1 := makePeer(1, withCap(26), withSuggest(), withExitRoutes(), withOnline(false), withNodeKey())
+	offlinePeer2 := makePeer(2, withCap(26), withSuggest(), withExitRoutes(), withOnline(false), withNodeKey())
 	updatedNetmap := &netmap.NetworkMap{
 		Peers: []tailcfg.NodeView{
-			newPeer1,
-			peer2,
+			peer1,
+			offlinePeer2,
 		},
 		DERPMap: derpMap,
 	}
 	b.SetControlClientStatus(b.cc, controlclient.Status{NetMap: updatedNetmap})
-	lastExitNode := b.Prefs().ExitNodeID()
-	if firstExitNode == lastExitNode {
-		t.Errorf("did not switch exit nodes despite auto exit node going offline")
+	// But now that peer 2 is offline, we should switch to peer 1.
+	wantExitNode := peer1.StableID()
+	gotExitNode := b.Prefs().ExitNodeID()
+	if gotExitNode != wantExitNode {
+		t.Errorf("did not switch exit nodes despite auto exit node going offline: got %q; want %q", gotExitNode, wantExitNode)
 	}
 }
 
@@ -2421,7 +2868,7 @@ func TestApplySysPolicy(t *testing.T) {
 			t.Run("unit", func(t *testing.T) {
 				prefs := tt.prefs.Clone()
 
-				gotAnyChange := applySysPolicy(prefs, "", false)
+				gotAnyChange := applySysPolicy(prefs, false)
 
 				if gotAnyChange && prefs.Equals(&tt.prefs) {
 					t.Errorf("anyChange but prefs is unchanged: %v", prefs.Pretty())
@@ -2569,7 +3016,7 @@ func TestPreferencePolicyInfo(t *testing.T) {
 					prefs := defaultPrefs.AsStruct()
 					pp.set(prefs, tt.initialValue)
 
-					gotAnyChange := applySysPolicy(prefs, "", false)
+					gotAnyChange := applySysPolicy(prefs, false)
 
 					if gotAnyChange != tt.wantChange {
 						t.Errorf("anyChange=%v, want %v", gotAnyChange, tt.wantChange)
@@ -2654,7 +3101,7 @@ func TestOnTailnetDefaultAutoUpdate(t *testing.T) {
 			// On platforms that don't support auto-update we can never
 			// transition to auto-updates being enabled. The value should
 			// remain unchanged after onTailnetDefaultAutoUpdate.
-			if !clientupdate.CanAutoUpdate() && want.EqualBool(true) {
+			if !clientupdate.CanAutoUpdate() {
 				want = tt.before
 			}
 			if got := b.pm.CurrentPrefs().AutoUpdate().Apply; got != want {
@@ -2754,12 +3201,12 @@ func TestTCPHandlerForDstWithVIPService(t *testing.T) {
 					tailcfg.NodeAttrServiceHost: []tailcfg.RawMessage{tailcfg.RawMessage(svcIPMapJSON)},
 				},
 			}).View(),
-			UserProfiles: map[tailcfg.UserID]tailcfg.UserProfile{
-				tailcfg.UserID(1): {
+			UserProfiles: map[tailcfg.UserID]tailcfg.UserProfileView{
+				tailcfg.UserID(1): (&tailcfg.UserProfile{
 					LoginName:     "someone@example.com",
 					DisplayName:   "Some One",
 					ProfilePicURL: "https://example.com/photo.jpg",
-				},
+				}).View(),
 			},
 		},
 	)
@@ -3105,9 +3552,11 @@ func TestDriveManageShares(t *testing.T) {
 				b.driveSetSharesLocked(tt.existing)
 			}
 			if !tt.disabled {
-				self := b.netMap.SelfNode.AsStruct()
+				nm := ptr.To(*b.currentNode().NetMap())
+				self := nm.SelfNode.AsStruct()
 				self.CapMap = tailcfg.NodeCapMap{tailcfg.NodeAttrsTaildriveShare: nil}
-				b.netMap.SelfNode = self.View()
+				nm.SelfNode = self.View()
+				b.currentNode().SetNetMap(nm)
 				b.sys.Set(driveimpl.NewFileSystemForRemote(b.logf))
 			}
 			b.mu.Unlock()
@@ -3248,10 +3697,14 @@ type peerOptFunc func(*tailcfg.Node)
 
 func makePeer(id tailcfg.NodeID, opts ...peerOptFunc) tailcfg.NodeView {
 	node := &tailcfg.Node{
-		ID:       id,
-		StableID: tailcfg.StableNodeID(fmt.Sprintf("stable%d", id)),
-		Name:     fmt.Sprintf("peer%d", id),
-		HomeDERP: int(id),
+		ID:                id,
+		Key:               makeNodeKeyFromID(id),
+		DiscoKey:          makeDiscoKeyFromID(id),
+		StableID:          tailcfg.StableNodeID(fmt.Sprintf("stable%d", id)),
+		Name:              fmt.Sprintf("peer%d", id),
+		Online:            ptr.To(true),
+		MachineAuthorized: true,
+		HomeDERP:          int(id),
 	}
 	for _, opt := range opts {
 		opt(node)
@@ -3318,6 +3771,12 @@ func withOnline(isOnline bool) peerOptFunc {
 func withNodeKey() peerOptFunc {
 	return func(n *tailcfg.Node) {
 		n.Key = key.NewNode().Public()
+	}
+}
+
+func withAddresses(addresses ...netip.Prefix) peerOptFunc {
+	return func(n *tailcfg.Node) {
+		n.Addresses = append(n.Addresses, addresses...)
 	}
 }
 
@@ -4023,9 +4482,9 @@ func TestShouldAutoExitNode(t *testing.T) {
 			expectedBool:          false,
 		},
 		{
-			name:                  "auto prefix invalid suffix",
+			name:                  "auto prefix unknown suffix",
 			exitNodeIDPolicyValue: "auto:foo",
-			expectedBool:          false,
+			expectedBool:          true, // "auto:{unknown}" is treated as "auto:any"
 		},
 	}
 
@@ -4033,14 +4492,68 @@ func TestShouldAutoExitNode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			policyStore := source.NewTestStoreOf(t, source.TestSettingOf(
-				syspolicy.ExitNodeID, tt.exitNodeIDPolicyValue,
-			))
-			syspolicy.MustRegisterStoreForTest(t, "TestStore", setting.DeviceScope, policyStore)
-
-			got := shouldAutoExitNode()
+			got := isAutoExitNodeID(tailcfg.StableNodeID(tt.exitNodeIDPolicyValue))
 			if got != tt.expectedBool {
 				t.Fatalf("expected %v got %v for %v policy value", tt.expectedBool, got, tt.exitNodeIDPolicyValue)
+			}
+		})
+	}
+}
+
+func TestParseAutoExitNodeID(t *testing.T) {
+	tests := []struct {
+		name       string
+		exitNodeID string
+		wantOk     bool
+		wantExpr   ipn.ExitNodeExpression
+	}{
+		{
+			name:       "empty expr",
+			exitNodeID: "",
+			wantOk:     false,
+			wantExpr:   "",
+		},
+		{
+			name:       "no auto prefix",
+			exitNodeID: "foo",
+			wantOk:     false,
+			wantExpr:   "",
+		},
+		{
+			name:       "auto:any",
+			exitNodeID: "auto:any",
+			wantOk:     true,
+			wantExpr:   ipn.AnyExitNode,
+		},
+		{
+			name:       "auto:foo",
+			exitNodeID: "auto:foo",
+			wantOk:     true,
+			wantExpr:   "foo",
+		},
+		{
+			name:       "auto prefix but empty suffix",
+			exitNodeID: "auto:",
+			wantOk:     false,
+			wantExpr:   "",
+		},
+		{
+			name:       "auto prefix no colon",
+			exitNodeID: "auto",
+			wantOk:     false,
+			wantExpr:   "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotExpr, gotOk := parseAutoExitNodeID(tailcfg.StableNodeID(tt.exitNodeID))
+			if gotOk != tt.wantOk || gotExpr != tt.wantExpr {
+				if tt.wantOk {
+					t.Fatalf("got %v (%q); want %v (%q)", gotOk, gotExpr, tt.wantOk, tt.wantExpr)
+				} else {
+					t.Fatalf("got %v (%q); want false", gotOk, gotExpr)
+				}
 			}
 		})
 	}
@@ -4113,7 +4626,7 @@ func TestReadWriteRouteInfo(t *testing.T) {
 	}
 
 	// write the other routeInfo as the other profile
-	if err := b.pm.SwitchProfile("id2"); err != nil {
+	if _, _, err := b.pm.SwitchToProfileByID("id2"); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.storeRouteInfo(ri2); err != nil {
@@ -4121,7 +4634,7 @@ func TestReadWriteRouteInfo(t *testing.T) {
 	}
 
 	// read the routeInfo of the first profile
-	if err := b.pm.SwitchProfile("id1"); err != nil {
+	if _, _, err := b.pm.SwitchToProfileByID("id1"); err != nil {
 		t.Fatal(err)
 	}
 	readRi, err = b.readRouteInfoLocked()
@@ -4133,7 +4646,7 @@ func TestReadWriteRouteInfo(t *testing.T) {
 	}
 
 	// read the routeInfo of the second profile
-	if err := b.pm.SwitchProfile("id2"); err != nil {
+	if _, _, err := b.pm.SwitchToProfileByID("id2"); err != nil {
 		t.Fatal(err)
 	}
 	readRi, err = b.readRouteInfoLocked()
@@ -4396,19 +4909,27 @@ func TestNotificationTargetMatch(t *testing.T) {
 type newTestControlFn func(tb testing.TB, opts controlclient.Options) controlclient.Client
 
 func newLocalBackendWithTestControl(t *testing.T, enableLogging bool, newControl newTestControlFn) *LocalBackend {
+	return newLocalBackendWithSysAndTestControl(t, enableLogging, tsd.NewSystem(), newControl)
+}
+
+func newLocalBackendWithSysAndTestControl(t *testing.T, enableLogging bool, sys *tsd.System, newControl newTestControlFn) *LocalBackend {
 	logf := logger.Discard
 	if enableLogging {
 		logf = tstest.WhileTestRunningLogger(t)
 	}
-	sys := new(tsd.System)
-	store := new(mem.Store)
-	sys.Set(store)
-	e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry())
-	if err != nil {
-		t.Fatalf("NewFakeUserspaceEngine: %v", err)
+
+	if _, hasStore := sys.StateStore.GetOK(); !hasStore {
+		store := new(mem.Store)
+		sys.Set(store)
 	}
-	t.Cleanup(e.Close)
-	sys.Set(e)
+	if _, hasEngine := sys.Engine.GetOK(); !hasEngine {
+		e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry(), sys.Bus.Get())
+		if err != nil {
+			t.Fatalf("NewFakeUserspaceEngine: %v", err)
+		}
+		t.Cleanup(e.Close)
+		sys.Set(e)
+	}
 
 	b, err := NewLocalBackend(logf, logid.PublicID{}, sys, 0)
 	if err != nil {
@@ -4743,32 +5264,132 @@ func TestLoginNotifications(t *testing.T) {
 // TestConfigFileReload tests that the LocalBackend reloads its configuration
 // when the configuration file changes.
 func TestConfigFileReload(t *testing.T) {
-	cfg1 := `{"Hostname": "foo", "Version": "alpha0"}`
-	f := filepath.Join(t.TempDir(), "cfg")
-	must.Do(os.WriteFile(f, []byte(cfg1), 0600))
-	sys := new(tsd.System)
-	sys.InitialConfig = must.Get(conffile.Load(f))
-	lb := newTestLocalBackendWithSys(t, sys)
-	must.Do(lb.Start(ipn.Options{}))
-
-	lb.mu.Lock()
-	hn := lb.hostinfo.Hostname
-	lb.mu.Unlock()
-	if hn != "foo" {
-		t.Fatalf("got %q; want %q", hn, "foo")
+	type testCase struct {
+		name    string
+		initial *conffile.Config
+		updated *conffile.Config
+		checkFn func(*testing.T, *LocalBackend)
 	}
 
-	cfg2 := `{"Hostname": "bar", "Version": "alpha0"}`
-	must.Do(os.WriteFile(f, []byte(cfg2), 0600))
-	if !must.Get(lb.ReloadConfig()) {
-		t.Fatal("reload failed")
+	tests := []testCase{
+		{
+			name: "hostname_change",
+			initial: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version:  "alpha0",
+					Hostname: ptr.To("initial-host"),
+				},
+			},
+			updated: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version:  "alpha0",
+					Hostname: ptr.To("updated-host"),
+				},
+			},
+			checkFn: func(t *testing.T, b *LocalBackend) {
+				if got := b.Prefs().Hostname(); got != "updated-host" {
+					t.Errorf("hostname = %q; want updated-host", got)
+				}
+			},
+		},
+		{
+			name: "start_advertising_services",
+			initial: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version: "alpha0",
+				},
+			},
+			updated: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version:           "alpha0",
+					AdvertiseServices: []string{"svc:abc", "svc:def"},
+				},
+			},
+			checkFn: func(t *testing.T, b *LocalBackend) {
+				if got := b.Prefs().AdvertiseServices().AsSlice(); !reflect.DeepEqual(got, []string{"svc:abc", "svc:def"}) {
+					t.Errorf("AdvertiseServices = %v; want [svc:abc, svc:def]", got)
+				}
+			},
+		},
+		{
+			name: "change_advertised_services",
+			initial: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version:           "alpha0",
+					AdvertiseServices: []string{"svc:abc", "svc:def"},
+				},
+			},
+			updated: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version:           "alpha0",
+					AdvertiseServices: []string{"svc:abc", "svc:ghi"},
+				},
+			},
+			checkFn: func(t *testing.T, b *LocalBackend) {
+				if got := b.Prefs().AdvertiseServices().AsSlice(); !reflect.DeepEqual(got, []string{"svc:abc", "svc:ghi"}) {
+					t.Errorf("AdvertiseServices = %v; want [svc:abc, svc:ghi]", got)
+				}
+			},
+		},
+		{
+			name: "unset_advertised_services",
+			initial: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version:           "alpha0",
+					AdvertiseServices: []string{"svc:abc"},
+				},
+			},
+			updated: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version: "alpha0",
+				},
+			},
+			checkFn: func(t *testing.T, b *LocalBackend) {
+				if b.Prefs().AdvertiseServices().Len() != 0 {
+					t.Errorf("got %d AdvertiseServices wants none", b.Prefs().AdvertiseServices().Len())
+				}
+			},
+		},
 	}
 
-	lb.mu.Lock()
-	hn = lb.hostinfo.Hostname
-	lb.mu.Unlock()
-	if hn != "bar" {
-		t.Fatalf("got %q; want %q", hn, "bar")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "tailscale.conf")
+
+			// Write initial config
+			initialJSON, err := json.Marshal(tc.initial.Parsed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, initialJSON, 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			// Create backend with initial config
+			tc.initial.Path = path
+			tc.initial.Raw = initialJSON
+			sys := tsd.NewSystem()
+			sys.InitialConfig = tc.initial
+			b := newTestLocalBackendWithSys(t, sys)
+
+			// Update config file
+			updatedJSON, err := json.Marshal(tc.updated.Parsed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, updatedJSON, 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			// Trigger reload
+			if ok, err := b.ReloadConfig(); !ok || err != nil {
+				t.Fatalf("ReloadConfig() = %v, %v; want true, nil", ok, err)
+			}
+
+			// Check outcome
+			tc.checkFn(t, b)
+		})
 	}
 }
 
@@ -5058,10 +5679,17 @@ func TestUpdatePrefsOnSysPolicyChange(t *testing.T) {
 	}
 }
 
-func TestUpdateIngressLocked(t *testing.T) {
+func TestUpdateIngressAndServiceHashLocked(t *testing.T) {
+	prefs := ipn.NewPrefs().View()
+	previousSC := &ipn.ServeConfig{
+		Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+			"svc:abc": {Tun: true},
+		},
+	}
 	tests := []struct {
 		name              string
 		hi                *tailcfg.Hostinfo
+		hasPreviousSC     bool // whether to overwrite the ServeConfig hash in the Hostinfo using previousSC
 		sc                *ipn.ServeConfig
 		wantIngress       bool
 		wantWireIngress   bool
@@ -5084,7 +5712,17 @@ func TestUpdateIngressLocked(t *testing.T) {
 				},
 			},
 			wantIngress:       true,
-			wantWireIngress:   true,
+			wantWireIngress:   false, // implied by wantIngress
+			wantControlUpdate: true,
+		},
+		{
+			name: "empty_hostinfo_service_configured",
+			hi:   &tailcfg.Hostinfo{},
+			sc: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:abc": {Tun: true},
+				},
+			},
 			wantControlUpdate: true,
 		},
 		{
@@ -5099,7 +5737,7 @@ func TestUpdateIngressLocked(t *testing.T) {
 			wantControlUpdate: true,
 		},
 		{
-			name: "empty_hostinfo_no_funnel",
+			name: "empty_hostinfo_no_funnel_no_service",
 			hi:   &tailcfg.Hostinfo{},
 			sc: &ipn.ServeConfig{
 				TCP: map[uint16]*ipn.TCPPortHandler{
@@ -5111,7 +5749,6 @@ func TestUpdateIngressLocked(t *testing.T) {
 			name: "funnel_enabled_no_change",
 			hi: &tailcfg.Hostinfo{
 				IngressEnabled: true,
-				WireIngress:    true,
 			},
 			sc: &ipn.ServeConfig{
 				AllowFunnel: map[ipn.HostPort]bool{
@@ -5119,7 +5756,17 @@ func TestUpdateIngressLocked(t *testing.T) {
 				},
 			},
 			wantIngress:     true,
-			wantWireIngress: true,
+			wantWireIngress: false, // implied by wantIngress
+		},
+		{
+			name:          "service_hash_no_change",
+			hi:            &tailcfg.Hostinfo{},
+			hasPreviousSC: true,
+			sc: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:abc": {Tun: true},
+				},
+			},
 		},
 		{
 			name: "funnel_disabled_no_change",
@@ -5134,10 +5781,16 @@ func TestUpdateIngressLocked(t *testing.T) {
 			wantWireIngress: true, // true if there is any AllowFunnel block
 		},
 		{
+			name:              "service_got_removed",
+			hi:                &tailcfg.Hostinfo{},
+			hasPreviousSC:     true,
+			sc:                &ipn.ServeConfig{},
+			wantControlUpdate: true,
+		},
+		{
 			name: "funnel_changes_to_disabled",
 			hi: &tailcfg.Hostinfo{
 				IngressEnabled: true,
-				WireIngress:    true,
 			},
 			sc: &ipn.ServeConfig{
 				AllowFunnel: map[ipn.HostPort]bool{
@@ -5157,16 +5810,39 @@ func TestUpdateIngressLocked(t *testing.T) {
 					"tailnet.xyz:443": true,
 				},
 			},
-			wantWireIngress:   true,
 			wantIngress:       true,
+			wantWireIngress:   false, // implied by wantIngress
+			wantControlUpdate: true,
+		},
+		{
+			name: "both_funnel_and_service_changes",
+			hi: &tailcfg.Hostinfo{
+				IngressEnabled: true,
+			},
+			sc: &ipn.ServeConfig{
+				AllowFunnel: map[ipn.HostPort]bool{
+					"tailnet.xyz:443": false,
+				},
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:abc": {Tun: true},
+				},
+			},
+			wantWireIngress:   true, // true if there is any AllowFunnel block
 			wantControlUpdate: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			b := newTestLocalBackend(t)
 			b.hostinfo = tt.hi
+			if tt.hasPreviousSC {
+				b.mu.Lock()
+				b.serveConfig = previousSC.View()
+				b.hostinfo.ServicesHash = b.vipServiceHash(b.vipServicesFromPrefsLocked(prefs))
+				b.mu.Unlock()
+			}
 			b.serveConfig = tt.sc.View()
 			allDone := make(chan bool, 1)
 			defer b.goTracker.AddDoneCallback(func() {
@@ -5182,7 +5858,7 @@ func TestUpdateIngressLocked(t *testing.T) {
 			})()
 
 			was := b.goTracker.StartedGoroutines()
-			b.updateIngressLocked()
+			b.updateIngressAndServiceHashLocked(prefs)
 
 			if tt.hi != nil {
 				if tt.hi.IngressEnabled != tt.wantIngress {
@@ -5190,6 +5866,12 @@ func TestUpdateIngressLocked(t *testing.T) {
 				}
 				if tt.hi.WireIngress != tt.wantWireIngress {
 					t.Errorf("WireIngress = %v, want %v", tt.hi.WireIngress, tt.wantWireIngress)
+				}
+				b.mu.Lock()
+				svcHash := b.vipServiceHash(b.vipServicesFromPrefsLocked(prefs))
+				b.mu.Unlock()
+				if tt.hi.ServicesHash != svcHash {
+					t.Errorf("ServicesHash = %v, want %v", tt.hi.ServicesHash, svcHash)
 				}
 			}
 
@@ -5205,6 +5887,240 @@ func TestUpdateIngressLocked(t *testing.T) {
 				case <-allDone:
 				}
 			}
+		})
+	}
+}
+
+// TestSrcCapPacketFilter tests that LocalBackend handles packet filters with
+// SrcCaps instead of Srcs (IPs)
+func TestSrcCapPacketFilter(t *testing.T) {
+	lb := newLocalBackendWithTestControl(t, false, func(tb testing.TB, opts controlclient.Options) controlclient.Client {
+		return newClient(tb, opts)
+	})
+	if err := lb.Start(ipn.Options{}); err != nil {
+		t.Fatalf("(*LocalBackend).Start(): %v", err)
+	}
+
+	var k key.NodePublic
+	must.Do(k.UnmarshalText([]byte("nodekey:5c8f86d5fc70d924e55f02446165a5dae8f822994ad26bcf4b08fd841f9bf261")))
+
+	controlClient := lb.cc.(*mockControl)
+	controlClient.send(nil, "", false, &netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{
+			Addresses: []netip.Prefix{netip.MustParsePrefix("1.1.1.1/32")},
+		}).View(),
+		Peers: []tailcfg.NodeView{
+			(&tailcfg.Node{
+				Addresses: []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
+				ID:        2,
+				Key:       k,
+				CapMap:    tailcfg.NodeCapMap{"cap-X": nil}, // node 2 has cap
+			}).View(),
+			(&tailcfg.Node{
+				Addresses: []netip.Prefix{netip.MustParsePrefix("3.3.3.3/32")},
+				ID:        3,
+				Key:       k,
+				CapMap:    tailcfg.NodeCapMap{}, // node 3 does not have the cap
+			}).View(),
+		},
+		PacketFilter: []filtertype.Match{{
+			IPProto: views.SliceOf([]ipproto.Proto{ipproto.TCP}),
+			SrcCaps: []tailcfg.NodeCapability{"cap-X"}, // cap in packet filter rule
+			Dsts: []filtertype.NetPortRange{{
+				Net: netip.MustParsePrefix("1.1.1.1/32"),
+				Ports: filtertype.PortRange{
+					First: 22,
+					Last:  22,
+				},
+			}},
+		}},
+	})
+
+	f := lb.GetFilterForTest()
+	res := f.Check(netip.MustParseAddr("2.2.2.2"), netip.MustParseAddr("1.1.1.1"), 22, ipproto.TCP)
+	if res != filter.Accept {
+		t.Errorf("Check(2.2.2.2, ...) = %s, want %s", res, filter.Accept)
+	}
+
+	res = f.Check(netip.MustParseAddr("3.3.3.3"), netip.MustParseAddr("1.1.1.1"), 22, ipproto.TCP)
+	if !res.IsDrop() {
+		t.Error("IsDrop() for node without cap = false, want true")
+	}
+}
+
+func TestDisplayMessages(t *testing.T) {
+	b := newTestLocalBackend(t)
+
+	// Pretend we're in a map poll so health updates get processed
+	ht := b.HealthTracker()
+	ht.SetIPNState("NeedsLogin", true)
+	ht.GotStreamedMapResponse()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.setNetMapLocked(&netmap.NetworkMap{
+		DisplayMessages: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+			"test-message": {
+				Title: "Testing",
+			},
+		},
+	})
+
+	state := ht.CurrentState()
+	wantID := health.WarnableCode("control-health.test-message")
+	_, ok := state.Warnings[wantID]
+
+	if !ok {
+		t.Errorf("no warning found with id %q", wantID)
+	}
+}
+
+// TestDisplayMessagesURLFilter tests that we filter out any URLs that are not
+// valid as a pop browser URL (see [LocalBackend.validPopBrowserURL]).
+func TestDisplayMessagesURLFilter(t *testing.T) {
+	b := newTestLocalBackend(t)
+
+	// Pretend we're in a map poll so health updates get processed
+	ht := b.HealthTracker()
+	ht.SetIPNState("NeedsLogin", true)
+	ht.GotStreamedMapResponse()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.setNetMapLocked(&netmap.NetworkMap{
+		DisplayMessages: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+			"test-message": {
+				Title:    "Testing",
+				Severity: tailcfg.SeverityHigh,
+				PrimaryAction: &tailcfg.DisplayMessageAction{
+					URL:   "https://www.evil.com",
+					Label: "Phishing Link",
+				},
+			},
+		},
+	})
+
+	state := ht.CurrentState()
+	wantID := health.WarnableCode("control-health.test-message")
+	got, ok := state.Warnings[wantID]
+
+	if !ok {
+		t.Fatalf("no warning found with id %q", wantID)
+	}
+
+	want := health.UnhealthyState{
+		WarnableCode: wantID,
+		Title:        "Testing",
+		Severity:     health.SeverityHigh,
+	}
+
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("Unexpected message content (-want/+got):\n%s", diff)
+	}
+}
+
+// TestDisplayMessageIPNBus checks that we send health messages appropriately
+// based on whether the watcher has sent the [ipn.NotifyHealthActions] watch
+// option or not.
+func TestDisplayMessageIPNBus(t *testing.T) {
+	type test struct {
+		name        string
+		mask        ipn.NotifyWatchOpt
+		wantWarning health.UnhealthyState
+	}
+
+	msgs := map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+		"test-message": {
+			Title:    "Message title",
+			Text:     "Message text.",
+			Severity: tailcfg.SeverityMedium,
+			PrimaryAction: &tailcfg.DisplayMessageAction{
+				URL:   "https://example.com",
+				Label: "Learn more",
+			},
+		},
+	}
+
+	wantID := health.WarnableCode("control-health.test-message")
+
+	for _, tt := range []test{
+		{
+			name: "older-client-no-actions",
+			mask: 0,
+			wantWarning: health.UnhealthyState{
+				WarnableCode:  wantID,
+				Severity:      health.SeverityMedium,
+				Title:         "Message title",
+				Text:          "Message text. Learn more: https://example.com", // PrimaryAction appended to text
+				PrimaryAction: nil,                                             // PrimaryAction not included
+			},
+		},
+		{
+			name: "new-client-with-actions",
+			mask: ipn.NotifyHealthActions,
+			wantWarning: health.UnhealthyState{
+				WarnableCode: wantID,
+				Severity:     health.SeverityMedium,
+				Title:        "Message title",
+				Text:         "Message text.",
+				PrimaryAction: &health.UnhealthyStateAction{
+					URL:   "https://example.com",
+					Label: "Learn more",
+				},
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			lb := newLocalBackendWithTestControl(t, false, func(tb testing.TB, opts controlclient.Options) controlclient.Client {
+				return newClient(tb, opts)
+			})
+
+			ipnWatcher := newNotificationWatcher(t, lb, nil)
+			ipnWatcher.watch(tt.mask, []wantedNotification{{
+				name: fmt.Sprintf("warning with ID %q", wantID),
+				cond: func(_ testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+					if n.Health == nil {
+						return false
+					}
+					got, ok := n.Health.Warnings[wantID]
+					if ok {
+						if diff := cmp.Diff(tt.wantWarning, got); diff != "" {
+							t.Errorf("unexpected warning details (-want/+got):\n%s", diff)
+							return true // we failed the test so tell the watcher we've seen what we need to to stop it waiting
+						}
+					} else {
+						got := slices.Collect(maps.Keys(n.Health.Warnings))
+						t.Logf("saw warnings: %v", got)
+					}
+					return ok
+				},
+			}})
+
+			lb.SetPrefsForTest(&ipn.Prefs{
+				ControlURL:  "https://localhost:1/",
+				WantRunning: true,
+				LoggedOut:   false,
+			})
+			if err := lb.Start(ipn.Options{}); err != nil {
+				t.Fatalf("(*LocalBackend).Start(): %v", err)
+			}
+
+			cc := lb.cc.(*mockControl)
+
+			// Assert that we are logged in and authorized, and also send our DisplayMessages
+			cc.send(nil, "", true, &netmap.NetworkMap{
+				SelfNode:        (&tailcfg.Node{MachineAuthorized: true}).View(),
+				DisplayMessages: msgs,
+			})
+
+			// Tell the health tracker that we are in a map poll because
+			// mockControl doesn't tell it
+			lb.HealthTracker().GotStreamedMapResponse()
+
+			// Assert that we got the expected notification
+			ipnWatcher.check()
 		})
 	}
 }

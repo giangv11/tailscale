@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	crand "crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
@@ -38,6 +39,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale"
+	"tailscale.com/derp/derpconst"
 	"tailscale.com/disco"
 	"tailscale.com/envknob"
 	"tailscale.com/metrics"
@@ -132,11 +134,12 @@ type Server struct {
 	publicKey   key.NodePublic
 	logf        logger.Logf
 	memSys0     uint64 // runtime.MemStats.Sys at start (or early-ish)
-	meshKey     string
+	meshKey     key.DERPMesh
 	limitedLogf logger.Logf
 	metaCert    []byte // the encoded x509 cert to send after LetsEncrypt cert+intermediate
 	dupPolicy   dupPolicy
 	debug       bool
+	localClient local.Client
 
 	// Counters:
 	packetsSent, bytesSent     expvar.Int
@@ -461,8 +464,13 @@ func genDroppedCounters() {
 // amongst themselves.
 //
 // It must be called before serving begins.
-func (s *Server) SetMeshKey(v string) {
-	s.meshKey = v
+func (s *Server) SetMeshKey(v string) error {
+	k, err := key.ParseDERPMesh(v)
+	if err != nil {
+		return err
+	}
+	s.meshKey = k
+	return nil
 }
 
 // SetVerifyClients sets whether this DERP server verifies clients through tailscaled.
@@ -485,6 +493,16 @@ func (s *Server) SetVerifyClientURLFailOpen(v bool) {
 	s.verifyClientsURLFailOpen = v
 }
 
+// SetTailscaledSocketPath sets the unix socket path to use to talk to
+// tailscaled if client verification is enabled.
+//
+// If unset or set to the empty string, the default path for the operating
+// system is used.
+func (s *Server) SetTailscaledSocketPath(path string) {
+	s.localClient.Socket = path
+	s.localClient.UseSocketOnly = path != ""
+}
+
 // SetTCPWriteTimeout sets the timeout for writing to connected clients.
 // This timeout does not apply to mesh connections.
 // Defaults to 2 seconds.
@@ -493,10 +511,10 @@ func (s *Server) SetTCPWriteTimeout(d time.Duration) {
 }
 
 // HasMeshKey reports whether the server is configured with a mesh key.
-func (s *Server) HasMeshKey() bool { return s.meshKey != "" }
+func (s *Server) HasMeshKey() bool { return !s.meshKey.IsZero() }
 
 // MeshKey returns the configured mesh key, if any.
-func (s *Server) MeshKey() string { return s.meshKey }
+func (s *Server) MeshKey() key.DERPMesh { return s.meshKey }
 
 // PrivateKey returns the server's private key.
 func (s *Server) PrivateKey() key.NodePrivate { return s.privateKey }
@@ -605,7 +623,7 @@ func (s *Server) initMetacert() {
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(ProtocolVersion),
 		Subject: pkix.Name{
-			CommonName: fmt.Sprintf("derpkey%s", s.publicKey.UntypedHexString()),
+			CommonName: derpconst.MetaCertCommonNamePrefix + s.publicKey.UntypedHexString(),
 		},
 		// Windows requires NotAfter and NotBefore set:
 		NotAfter:  s.clock.Now().Add(30 * 24 * time.Hour),
@@ -624,6 +642,25 @@ func (s *Server) initMetacert() {
 // MetaCert returns the server metadata cert that can be sent by the
 // TLS server to let the client skip a round trip during start-up.
 func (s *Server) MetaCert() []byte { return s.metaCert }
+
+// ModifyTLSConfigToAddMetaCert modifies c.GetCertificate to make
+// it append s.MetaCert to the returned certificates.
+//
+// It panics if c or c.GetCertificate is nil.
+func (s *Server) ModifyTLSConfigToAddMetaCert(c *tls.Config) {
+	getCert := c.GetCertificate
+	if getCert == nil {
+		panic("c.GetCertificate is nil")
+	}
+	c.GetCertificate = func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		cert, err := getCert(hi)
+		if err != nil {
+			return nil, err
+		}
+		cert.Certificate = append(cert.Certificate, s.MetaCert())
+		return cert, nil
+	}
+}
 
 // registerClient notes that client c is now authenticated and ready for packets.
 //
@@ -1320,12 +1357,18 @@ func (c *sclient) requestMeshUpdate() {
 	}
 }
 
-var localClient local.Client
-
 // isMeshPeer reports whether the client is a trusted mesh peer
 // node in the DERP region.
 func (s *Server) isMeshPeer(info *clientInfo) bool {
-	return info != nil && info.MeshKey != "" && info.MeshKey == s.meshKey
+	// Compare mesh keys in constant time to prevent timing attacks.
+	// Since mesh keys are a fixed length, we don’t need to be concerned
+	// about timing attacks on client mesh keys that are the wrong length.
+	// See https://github.com/tailscale/corp/issues/28720
+	if info == nil || info.MeshKey.IsZero() {
+		return false
+	}
+
+	return s.meshKey.Equal(info.MeshKey)
 }
 
 // verifyClient checks whether the client is allowed to connect to the derper,
@@ -1340,7 +1383,7 @@ func (s *Server) verifyClient(ctx context.Context, clientKey key.NodePublic, inf
 
 	// tailscaled-based verification:
 	if s.verifyClientsLocalTailscaled {
-		_, err := localClient.WhoIsNodeKey(ctx, clientKey)
+		_, err := s.localClient.WhoIsNodeKey(ctx, clientKey)
 		if err == tailscale.ErrPeerNotFound {
 			return fmt.Errorf("peer %v not authorized (not found in local tailscaled)", clientKey)
 		}
@@ -1746,7 +1789,7 @@ func (c *sclient) sendLoop(ctx context.Context) error {
 	defer c.onSendLoopDone()
 
 	jitter := rand.N(5 * time.Second)
-	keepAliveTick, keepAliveTickChannel := c.s.clock.NewTicker(keepAlive + jitter)
+	keepAliveTick, keepAliveTickChannel := c.s.clock.NewTicker(KeepAlive + jitter)
 	defer keepAliveTick.Stop()
 
 	var werr error // last write error
@@ -2240,7 +2283,7 @@ func (s *Server) ConsistencyCheck() error {
 func (s *Server) checkVerifyClientsLocalTailscaled() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	status, err := localClient.StatusWithoutPeers(ctx)
+	status, err := s.localClient.StatusWithoutPeers(ctx)
 	if err != nil {
 		return fmt.Errorf("localClient.Status: %w", err)
 	}

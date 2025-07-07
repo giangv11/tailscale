@@ -17,6 +17,9 @@ metadata:
   name: tailscale-operator
 rules:
 - apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
   resources: ["events", "services", "services/status"]
   verbs: ["create","delete","deletecollection","get","list","patch","update","watch"]
 - apiGroups: ["networking.k8s.io"]
@@ -24,6 +27,9 @@ rules:
   verbs: ["create","delete","deletecollection","get","list","patch","update","watch"]
 - apiGroups: ["networking.k8s.io"]
   resources: ["ingressclasses"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["discovery.k8s.io"]
+  resources: ["endpointslices"]
   verbs: ["get", "list", "watch"]
 - apiGroups: ["tailscale.com"]
   resources: ["connectors", "connectors/status", "proxyclasses", "proxyclasses/status", "proxygroups", "proxygroups/status"]
@@ -75,7 +81,7 @@ rules:
   verbs: ["get", "list", "watch", "create", "update", "deletecollection"]
 - apiGroups: ["rbac.authorization.k8s.io"]
   resources: ["roles", "rolebindings"]
-  verbs: ["get", "create", "patch", "update", "list", "watch"]
+  verbs: ["get", "create", "patch", "update", "list", "watch", "deletecollection"]
 - apiGroups: ["monitoring.coreos.com"]
   resources: ["servicemonitors"]
   verbs: ["get", "list", "update", "create", "delete"]

@@ -27,8 +27,8 @@ import (
 	"github.com/peterbourgon/ff/v3/ffcli"
 	qrcode "github.com/skip2/go-qrcode"
 	"golang.org/x/oauth2/clientcredentials"
-	"tailscale.com/client/tailscale"
 	"tailscale.com/health/healthmsg"
+	"tailscale.com/internal/client/tailscale"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/netutil"
@@ -39,7 +39,6 @@ import (
 	"tailscale.com/types/preftype"
 	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
-	"tailscale.com/version"
 	"tailscale.com/version/distro"
 )
 
@@ -79,14 +78,8 @@ func effectiveGOOS() string {
 // acceptRouteDefault returns the CLI's default value of --accept-routes as
 // a function of the platform it's running on.
 func acceptRouteDefault(goos string) bool {
-	switch goos {
-	case "windows":
-		return true
-	case "darwin":
-		return version.IsSandboxedMacOS()
-	default:
-		return false
-	}
+	var p *ipn.Prefs
+	return p.DefaultRouteAll(goos)
 }
 
 var upFlagSet = newUpFlagSet(effectiveGOOS(), &upArgsGlobal, "up")
@@ -116,7 +109,7 @@ func newUpFlagSet(goos string, upArgs *upArgsT, cmd string) *flag.FlagSet {
 	upf.StringVar(&upArgs.advertiseRoutes, "advertise-routes", "", "routes to advertise to other nodes (comma-separated, e.g. \"10.0.0.0/8,192.168.0.0/24\") or empty string to not advertise routes")
 	upf.BoolVar(&upArgs.advertiseConnector, "advertise-connector", false, "advertise this node as an app connector")
 	upf.BoolVar(&upArgs.advertiseDefaultRoute, "advertise-exit-node", false, "offer to be an exit node for internet traffic for the tailnet")
-	upf.BoolVar(&upArgs.postureChecking, "posture-checking", false, hidden+"allow management plane to gather device posture information")
+	upf.BoolVar(&upArgs.postureChecking, "report-posture", false, hidden+"allow management plane to gather device posture information")
 
 	if safesocket.GOOSUsesPeerCreds(goos) {
 		upf.StringVar(&upArgs.opUser, "operator", "", "Unix username to allow to operate on tailscaled without sudo")
@@ -488,6 +481,9 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 	}
 
 	warnOnAdvertiseRouts(ctx, prefs)
+	if err := checkExitNodeRisk(ctx, prefs, upArgs.acceptedRisks); err != nil {
+		return err
+	}
 
 	curPrefs, err := localClient.GetPrefs(ctx)
 	if err != nil {
@@ -779,7 +775,8 @@ func init() {
 	addPrefFlagMapping("update-check", "AutoUpdate.Check")
 	addPrefFlagMapping("auto-update", "AutoUpdate.Apply")
 	addPrefFlagMapping("advertise-connector", "AppConnector")
-	addPrefFlagMapping("posture-checking", "PostureChecking")
+	addPrefFlagMapping("report-posture", "PostureChecking")
+	addPrefFlagMapping("relay-server-port", "RelayServerPort")
 }
 
 func addPrefFlagMapping(flagName string, prefNames ...string) {
@@ -1056,7 +1053,7 @@ func prefsToFlags(env upCheckEnv, prefs *ipn.Prefs) (flagVal map[string]any) {
 			set(prefs.NetfilterMode.String())
 		case "unattended":
 			set(prefs.ForceDaemon)
-		case "posture-checking":
+		case "report-posture":
 			set(prefs.PostureChecking)
 		}
 	})
@@ -1095,12 +1092,6 @@ func exitNodeIP(p *ipn.Prefs, st *ipnstate.Status) (ip netip.Addr) {
 		}
 	}
 	return
-}
-
-func init() {
-	// Required to use our client API. We're fine with the instability since the
-	// client lives in the same repo as this code.
-	tailscale.I_Acknowledge_This_API_Is_Unstable = true
 }
 
 // resolveAuthKey either returns v unchanged (in the common case) or, if it

@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
@@ -22,6 +23,7 @@ import (
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/safesocket"
 	"tailscale.com/types/opt"
+	"tailscale.com/types/ptr"
 	"tailscale.com/types/views"
 	"tailscale.com/version"
 )
@@ -58,18 +60,19 @@ type setArgsT struct {
 	forceDaemon            bool
 	updateCheck            bool
 	updateApply            bool
-	postureChecking        bool
+	reportPosture          bool
 	snat                   bool
 	statefulFiltering      bool
 	netfilterMode          string
+	relayServerPort        string
 }
 
 func newSetFlagSet(goos string, setArgs *setArgsT) *flag.FlagSet {
 	setf := newFlagSet("set")
 
 	setf.StringVar(&setArgs.profileName, "nickname", "", "nickname for the current account")
-	setf.BoolVar(&setArgs.acceptRoutes, "accept-routes", false, "accept routes advertised by other Tailscale nodes")
-	setf.BoolVar(&setArgs.acceptDNS, "accept-dns", false, "accept DNS configuration from the admin panel")
+	setf.BoolVar(&setArgs.acceptRoutes, "accept-routes", acceptRouteDefault(goos), "accept routes advertised by other Tailscale nodes")
+	setf.BoolVar(&setArgs.acceptDNS, "accept-dns", true, "accept DNS configuration from the admin panel")
 	setf.StringVar(&setArgs.exitNodeIP, "exit-node", "", "Tailscale exit node (IP or base name) for internet traffic, or empty string to not use an exit node")
 	setf.BoolVar(&setArgs.exitNodeAllowLANAccess, "exit-node-allow-lan-access", false, "Allow direct access to the local network when routing traffic via an exit node")
 	setf.BoolVar(&setArgs.shieldsUp, "shields-up", false, "don't allow incoming connections")
@@ -80,8 +83,9 @@ func newSetFlagSet(goos string, setArgs *setArgsT) *flag.FlagSet {
 	setf.BoolVar(&setArgs.advertiseConnector, "advertise-connector", false, "offer to be an app connector for domain specific internet traffic for the tailnet")
 	setf.BoolVar(&setArgs.updateCheck, "update-check", true, "notify about available Tailscale updates")
 	setf.BoolVar(&setArgs.updateApply, "auto-update", false, "automatically update to the latest available version")
-	setf.BoolVar(&setArgs.postureChecking, "posture-checking", false, hidden+"allow management plane to gather device posture information")
+	setf.BoolVar(&setArgs.reportPosture, "report-posture", false, "allow management plane to gather device posture information")
 	setf.BoolVar(&setArgs.runWebClient, "webclient", false, "expose the web interface for managing this node over Tailscale at port 5252")
+	setf.StringVar(&setArgs.relayServerPort, "relay-server-port", "", hidden+"UDP port number (0 will pick a random unused port) for the relay server to bind to, on all interfaces, or empty string to disable relay server functionality")
 
 	ffcomplete.Flag(setf, "exit-node", func(args []string) ([]string, ffcomplete.ShellCompDirective, error) {
 		st, err := localClient.Status(context.Background())
@@ -152,7 +156,7 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 			AppConnector: ipn.AppConnectorPrefs{
 				Advertise: setArgs.advertiseConnector,
 			},
-			PostureChecking:     setArgs.postureChecking,
+			PostureChecking:     setArgs.reportPosture,
 			NoStatefulFiltering: opt.NewBool(!setArgs.statefulFiltering),
 		},
 	}
@@ -179,6 +183,9 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 	}
 
 	warnOnAdvertiseRouts(ctx, &maskedPrefs.Prefs)
+	if err := checkExitNodeRisk(ctx, &maskedPrefs.Prefs, setArgs.acceptedRisks); err != nil {
+		return err
+	}
 	var advertiseExitNodeSet, advertiseRoutesSet bool
 	setFlagSet.Visit(func(f *flag.Flag) {
 		updateMaskedPrefsFromUpOrSetFlag(maskedPrefs, f.Name)
@@ -233,6 +240,15 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 			}
 		}
 	}
+
+	if setArgs.relayServerPort != "" {
+		uport, err := strconv.ParseUint(setArgs.relayServerPort, 10, 16)
+		if err != nil {
+			return fmt.Errorf("failed to set relay server port: %v", err)
+		}
+		maskedPrefs.Prefs.RelayServerPort = ptr.To(int(uport))
+	}
+
 	checkPrefs := curPrefs.Clone()
 	checkPrefs.ApplyEdits(maskedPrefs)
 	if err := localClient.CheckPrefs(ctx, checkPrefs); err != nil {

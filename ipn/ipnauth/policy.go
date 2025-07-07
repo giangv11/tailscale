@@ -7,9 +7,36 @@ import (
 	"errors"
 	"fmt"
 
+	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn"
+	"tailscale.com/tailcfg"
 	"tailscale.com/util/syspolicy"
 )
+
+type actorWithPolicyChecks struct{ Actor }
+
+// WithPolicyChecks returns an [Actor] that wraps the given actor and
+// performs additional policy checks on top of the access checks
+// implemented by the wrapped actor.
+func WithPolicyChecks(actor Actor) Actor {
+	// TODO(nickkhyl): We should probably exclude the Windows Local System
+	// account from policy checks as well.
+	switch actor.(type) {
+	case unrestricted:
+		return actor
+	default:
+		return &actorWithPolicyChecks{Actor: actor}
+	}
+}
+
+// CheckProfileAccess implements [Actor].
+func (a actorWithPolicyChecks) CheckProfileAccess(profile ipn.LoginProfileView, requestedAccess ProfileAccess, auditLogger AuditLogFunc) error {
+	if err := a.Actor.CheckProfileAccess(profile, requestedAccess, auditLogger); err != nil {
+		return err
+	}
+	requestReason := apitype.RequestReasonKey.Value(a.Context())
+	return CheckDisconnectPolicy(a.Actor, profile, requestReason, auditLogger)
+}
 
 // CheckDisconnectPolicy checks if the policy allows the specified actor to disconnect
 // Tailscale with the given optional reason. It returns nil if the operation is allowed,
@@ -22,7 +49,7 @@ import (
 //
 // TODO(nickkhyl): unexport it when we move [ipn.Actor] implementations from [ipnserver]
 // and corp to this package.
-func CheckDisconnectPolicy(actor Actor, profile ipn.LoginProfileView, reason string, auditLogger AuditLogFunc) error {
+func CheckDisconnectPolicy(actor Actor, profile ipn.LoginProfileView, reason string, auditFn AuditLogFunc) error {
 	if alwaysOn, _ := syspolicy.GetBoolean(syspolicy.AlwaysOn, false); !alwaysOn {
 		return nil
 	}
@@ -32,15 +59,16 @@ func CheckDisconnectPolicy(actor Actor, profile ipn.LoginProfileView, reason str
 	if reason == "" {
 		return errors.New("disconnect not allowed: reason required")
 	}
-	if auditLogger != nil {
+	if auditFn != nil {
 		var details string
 		if username, _ := actor.Username(); username != "" { // best-effort; we don't have it on all platforms
 			details = fmt.Sprintf("%q is being disconnected by %q: %v", profile.Name(), username, reason)
 		} else {
 			details = fmt.Sprintf("%q is being disconnected: %v", profile.Name(), reason)
 		}
-		// TODO(nickkhyl,barnstar): use a const for DISCONNECT_NODE.
-		auditLogger("DISCONNECT_NODE", details)
+		if err := auditFn(tailcfg.AuditNodeDisconnect, details); err != nil {
+			return err
+		}
 	}
 	return nil
 }

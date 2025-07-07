@@ -9,7 +9,6 @@ package logpolicy
 import (
 	"bufio"
 	"bytes"
-	"cmp"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -42,6 +41,7 @@ import (
 	"tailscale.com/net/netknob"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
+	"tailscale.com/net/netx"
 	"tailscale.com/net/tlsdial"
 	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/paths"
@@ -517,8 +517,9 @@ type Options struct {
 	MaxUploadSize int
 }
 
-// New returns a new log policy (a logger and its instance ID).
-func (opts Options) New() *Policy {
+// init initializes the log policy and returns a logtail.Config and the
+// Policy.
+func (opts Options) init(disableLogging bool) (*logtail.Config, *Policy) {
 	if hostinfo.IsNATLabGuestVM() {
 		// In NATLab Gokrazy instances, tailscaled comes up concurently with
 		// DHCP and the doesn't have DNS for a while. Wait for DHCP first.
@@ -627,7 +628,7 @@ func (opts Options) New() *Policy {
 		conf.IncludeProcSequence = true
 	}
 
-	if envknob.NoLogsNoSupport() || testenv.InTest() {
+	if disableLogging {
 		opts.Logf("You have disabled logging. Tailscale will not be able to provide support.")
 		conf.HTTPC = &http.Client{Transport: noopPretendSuccessTransport{}}
 	} else {
@@ -636,14 +637,15 @@ func (opts Options) New() *Policy {
 		attachFilchBuffer(&conf, opts.Dir, opts.CmdName, opts.MaxBufferSize, opts.Logf)
 		conf.HTTPC = opts.HTTPC
 
+		logHost := logtail.DefaultHost
+		if val := getLogTarget(); val != "" {
+			opts.Logf("You have enabled a non-default log target. Doing without being told to by Tailscale staff or your network administrator will make getting support difficult.")
+			conf.BaseURL = val
+			u, _ := url.Parse(val)
+			logHost = u.Host
+		}
+
 		if conf.HTTPC == nil {
-			logHost := logtail.DefaultHost
-			if val := getLogTarget(); val != "" {
-				opts.Logf("You have enabled a non-default log target. Doing without being told to by Tailscale staff or your network administrator will make getting support difficult.")
-				conf.BaseURL = val
-				u, _ := url.Parse(val)
-				logHost = u.Host
-			}
 			conf.HTTPC = &http.Client{Transport: TransportOptions{
 				Host:   logHost,
 				NetMon: opts.NetMon,
@@ -679,11 +681,18 @@ func (opts Options) New() *Policy {
 		opts.Logf("%s", earlyErrBuf.Bytes())
 	}
 
-	return &Policy{
+	return &conf, &Policy{
 		Logtail:  lw,
 		PublicID: newc.PublicID,
 		Logf:     opts.Logf,
 	}
+}
+
+// New returns a new log policy (a logger and its instance ID).
+func (opts Options) New() *Policy {
+	disableLogging := envknob.NoLogsNoSupport() || testenv.InTest() || runtime.GOOS == "plan9"
+	_, policy := opts.init(disableLogging)
+	return policy
 }
 
 // attachFilchBuffer creates an on-disk ring buffer using filch and attaches
@@ -769,7 +778,7 @@ func (p *Policy) Shutdown(ctx context.Context) error {
 //
 // The netMon parameter is optional. It should be specified in environments where
 // Tailscaled is manipulating the routing table.
-func MakeDialFunc(netMon *netmon.Monitor, logf logger.Logf) func(ctx context.Context, netw, addr string) (net.Conn, error) {
+func MakeDialFunc(netMon *netmon.Monitor, logf logger.Logf) netx.DialFunc {
 	if netMon == nil {
 		netMon = netmon.NewStatic()
 	}
@@ -901,8 +910,7 @@ func (opts TransportOptions) New() http.RoundTripper {
 		tr.TLSNextProto = map[string]func(authority string, c *tls.Conn) http.RoundTripper{}
 	}
 
-	host := cmp.Or(opts.Host, logtail.DefaultHost)
-	tr.TLSClientConfig = tlsdial.Config(host, opts.Health, tr.TLSClientConfig)
+	tr.TLSClientConfig = tlsdial.Config(opts.Health, tr.TLSClientConfig)
 	// Force TLS 1.3 since we know log.tailscale.com supports it.
 	tr.TLSClientConfig.MinVersion = tls.VersionTLS13
 

@@ -22,6 +22,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
 	"tailscale.com/ipn"
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/types/opt"
@@ -31,9 +32,9 @@ import (
 )
 
 const (
-	tailscaleIngressClassName      = "tailscale"                                   // ingressClass.metadata.name for tailscale IngressClass resource
 	tailscaleIngressControllerName = "tailscale.com/ts-ingress"                    // ingressClass.spec.controllerName for tailscale IngressClass resource
 	ingressClassDefaultAnnotation  = "ingressclass.kubernetes.io/is-default-class" // we do not support this https://kubernetes.io/docs/concepts/services-networking/ingress/#default-ingress-class
+	indexIngressProxyClass         = ".metadata.annotations.ingress-proxy-class"
 )
 
 type IngressReconciler struct {
@@ -50,6 +51,7 @@ type IngressReconciler struct {
 	managedIngresses set.Slice[types.UID]
 
 	defaultProxyClass string
+	ingressClassName  string
 }
 
 var (
@@ -73,6 +75,7 @@ func (a *IngressReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		return reconcile.Result{}, fmt.Errorf("failed to get ing: %w", err)
 	}
 	if !ing.DeletionTimestamp.IsZero() || !a.shouldExpose(ing) {
+		// TODO(irbekrm): this message is confusing if the Ingress is an HA Ingress
 		logger.Debugf("ingress is being deleted or should not be exposed, cleaning up")
 		return reconcile.Result{}, a.maybeCleanup(ctx, logger, ing)
 	}
@@ -129,7 +132,7 @@ func (a *IngressReconciler) maybeCleanup(ctx context.Context, logger *zap.Sugare
 // This function adds a finalizer to ing, ensuring that we can handle orderly
 // deprovisioning later.
 func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.SugaredLogger, ing *networkingv1.Ingress) error {
-	if err := validateIngressClass(ctx, a.Client); err != nil {
+	if err := validateIngressClass(ctx, a.Client, a.ingressClassName); err != nil {
 		logger.Warnf("error validating tailscale IngressClass: %v. In future this might be a terminal error.", err)
 	}
 	if !slices.Contains(ing.Finalizers, FinalizerName) {
@@ -217,6 +220,7 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		ChildResourceLabels: crl,
 		ProxyClassName:      proxyClass,
 		proxyType:           proxyTypeIngressResource,
+		LoginServer:         a.ssr.loginServer,
 	}
 
 	if val := ing.GetAnnotations()[AnnotationExperimentalForwardClusterTrafficViaL7IngresProxy]; val == "true" {
@@ -262,17 +266,17 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 func (a *IngressReconciler) shouldExpose(ing *networkingv1.Ingress) bool {
 	return ing != nil &&
 		ing.Spec.IngressClassName != nil &&
-		*ing.Spec.IngressClassName == tailscaleIngressClassName &&
+		*ing.Spec.IngressClassName == a.ingressClassName &&
 		ing.Annotations[AnnotationProxyGroup] == ""
 }
 
 // validateIngressClass attempts to validate that 'tailscale' IngressClass
 // included in Tailscale installation manifests exists and has not been modified
 // to attempt to enable features that we do not support.
-func validateIngressClass(ctx context.Context, cl client.Client) error {
+func validateIngressClass(ctx context.Context, cl client.Client, ingressClassName string) error {
 	ic := &networkingv1.IngressClass{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: tailscaleIngressClassName,
+			Name: ingressClassName,
 		},
 	}
 	if err := cl.Get(ctx, client.ObjectKeyFromObject(ic), ic); apierrors.IsNotFound(err) {
@@ -291,9 +295,15 @@ func validateIngressClass(ctx context.Context, cl client.Client) error {
 
 func handlersForIngress(ctx context.Context, ing *networkingv1.Ingress, cl client.Client, rec record.EventRecorder, tlsHost string, logger *zap.SugaredLogger) (handlers map[string]*ipn.HTTPHandler, err error) {
 	addIngressBackend := func(b *networkingv1.IngressBackend, path string) {
+		if path == "" {
+			path = "/"
+			rec.Eventf(ing, corev1.EventTypeNormal, "PathUndefined", "configured backend is missing a path, defaulting to '/'")
+		}
+
 		if b == nil {
 			return
 		}
+
 		if b.Service == nil {
 			rec.Eventf(ing, corev1.EventTypeWarning, "InvalidIngressBackend", "backend for path %q is missing service", path)
 			return

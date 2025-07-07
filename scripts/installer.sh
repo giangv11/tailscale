@@ -186,6 +186,12 @@ main() {
 					VERSION="$DEBIAN_CODENAME"
 				fi
 				;;
+			sparky)
+				OS="debian"
+				PACKAGETYPE="apt"
+				VERSION="$DEBIAN_CODENAME"
+				APT_KEY_TYPE="keyring"
+				;;
 			centos)
 				OS="$ID"
 				VERSION="$VERSION_ID"
@@ -202,8 +208,11 @@ main() {
 					PACKAGETYPE="yum"
 				fi
 				;;
-			rhel)
+			rhel|miraclelinux)
 				OS="$ID"
+				if [ "$ID" = "miraclelinux" ]; then
+					OS="rhel"
+				fi
 				VERSION="$(echo "$VERSION_ID" | cut -f1 -d.)"
 				PACKAGETYPE="dnf"
 				if [ "$VERSION" = "7" ]; then
@@ -487,10 +496,13 @@ main() {
 				legacy)
 					$CURL "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION.asc" | $SUDO apt-key add -
 					$CURL "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION.list" | $SUDO tee /etc/apt/sources.list.d/tailscale.list
+					$SUDO chmod 0644 /etc/apt/sources.list.d/tailscale.list
 				;;
 				keyring)
 					$CURL "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION.noarmor.gpg" | $SUDO tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+					$SUDO chmod 0644 /usr/share/keyrings/tailscale-archive-keyring.gpg
 					$CURL "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION.tailscale-keyring.list" | $SUDO tee /etc/apt/sources.list.d/tailscale.list
+					$SUDO chmod 0644 /etc/apt/sources.list.d/tailscale.list
 				;;
 			esac
 			$SUDO apt-get update
@@ -512,7 +524,7 @@ main() {
 		dnf)
 			# DNF 5 has a different argument format; determine which one we have.
 			DNF_VERSION="3"
-			if dnf --version | grep -q '^dnf5 version'; then
+			if LANG=C.UTF-8 dnf --version | grep -q '^dnf5 version'; then
 				DNF_VERSION="5"
 			fi
 

@@ -13,7 +13,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -24,8 +23,6 @@ import (
 	"regexp"
 	"runtime"
 	"strconv"
-	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -36,44 +33,28 @@ import (
 	"tailscale.com/client/tailscale"
 	"tailscale.com/clientupdate"
 	"tailscale.com/cmd/testwrapper/flakytest"
+	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
-	"tailscale.com/ipn/ipnlocal"
-	"tailscale.com/ipn/ipnstate"
-	"tailscale.com/ipn/store"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tstun"
-	"tailscale.com/safesocket"
-	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/tstest/integration/testcontrol"
 	"tailscale.com/types/key"
-	"tailscale.com/types/logger"
 	"tailscale.com/types/opt"
 	"tailscale.com/types/ptr"
-	"tailscale.com/util/dnsname"
 	"tailscale.com/util/must"
-	"tailscale.com/util/rands"
-	"tailscale.com/version"
 )
-
-var (
-	verboseTailscaled = flag.Bool("verbose-tailscaled", false, "verbose tailscaled logging")
-	verboseTailscale  = flag.Bool("verbose-tailscale", false, "verbose tailscale CLI logging")
-)
-
-var mainError syncs.AtomicValue[error]
 
 func TestMain(m *testing.M) {
 	// Have to disable UPnP which hits the network, otherwise it fails due to HTTP proxy.
 	os.Setenv("TS_DISABLE_UPNP", "true")
 	flag.Parse()
 	v := m.Run()
-	CleanupBinaries()
 	if v != 0 {
 		os.Exit(v)
 	}
-	if err := mainError.Load(); err != nil {
+	if err := MainError.Load(); err != nil {
 		fmt.Fprintf(os.Stderr, "FAIL: %v\n", err)
 		os.Exit(1)
 	}
@@ -88,9 +69,9 @@ func TestTUNMode(t *testing.T) {
 		t.Skip("skipping when not root")
 	}
 	tstest.Parallel(t)
-	env := newTestEnv(t)
+	env := NewTestEnv(t)
 	env.tunMode = true
-	n1 := newTestNode(t, env)
+	n1 := NewTestNode(t, env)
 	d1 := n1.StartDaemon()
 
 	n1.AwaitResponding()
@@ -105,8 +86,8 @@ func TestTUNMode(t *testing.T) {
 func TestOneNodeUpNoAuth(t *testing.T) {
 	tstest.Shard(t)
 	tstest.Parallel(t)
-	env := newTestEnv(t)
-	n1 := newTestNode(t, env)
+	env := NewTestEnv(t)
+	n1 := NewTestNode(t, env)
 
 	d1 := n1.StartDaemon()
 	n1.AwaitResponding()
@@ -123,8 +104,8 @@ func TestOneNodeUpNoAuth(t *testing.T) {
 func TestOneNodeExpiredKey(t *testing.T) {
 	tstest.Shard(t)
 	tstest.Parallel(t)
-	env := newTestEnv(t)
-	n1 := newTestNode(t, env)
+	env := NewTestEnv(t)
+	n1 := NewTestNode(t, env)
 
 	d1 := n1.StartDaemon()
 	n1.AwaitResponding()
@@ -160,8 +141,8 @@ func TestOneNodeExpiredKey(t *testing.T) {
 func TestControlKnobs(t *testing.T) {
 	tstest.Shard(t)
 	tstest.Parallel(t)
-	env := newTestEnv(t)
-	n1 := newTestNode(t, env)
+	env := NewTestEnv(t)
+	n1 := NewTestNode(t, env)
 
 	d1 := n1.StartDaemon()
 	defer d1.MustCleanShutdown(t)
@@ -191,8 +172,8 @@ func TestControlKnobs(t *testing.T) {
 func TestCollectPanic(t *testing.T) {
 	tstest.Shard(t)
 	tstest.Parallel(t)
-	env := newTestEnv(t)
-	n := newTestNode(t, env)
+	env := NewTestEnv(t)
+	n := NewTestNode(t, env)
 
 	cmd := exec.Command(env.daemon, "--cleanup")
 	cmd.Env = append(os.Environ(),
@@ -222,9 +203,9 @@ func TestCollectPanic(t *testing.T) {
 func TestControlTimeLogLine(t *testing.T) {
 	tstest.Shard(t)
 	tstest.Parallel(t)
-	env := newTestEnv(t)
+	env := NewTestEnv(t)
 	env.LogCatcher.StoreRawJSON()
-	n := newTestNode(t, env)
+	n := NewTestNode(t, env)
 
 	n.StartDaemon()
 	n.AwaitResponding()
@@ -246,8 +227,8 @@ func TestControlTimeLogLine(t *testing.T) {
 func TestStateSavedOnStart(t *testing.T) {
 	tstest.Shard(t)
 	tstest.Parallel(t)
-	env := newTestEnv(t)
-	n1 := newTestNode(t, env)
+	env := NewTestEnv(t)
+	n1 := NewTestNode(t, env)
 
 	d1 := n1.StartDaemon()
 	n1.AwaitResponding()
@@ -265,7 +246,7 @@ func TestStateSavedOnStart(t *testing.T) {
 	n1.MustDown()
 
 	// And change the hostname to something:
-	if err := n1.Tailscale("up", "--login-server="+n1.env.controlURL(), "--hostname=foo").Run(); err != nil {
+	if err := n1.Tailscale("up", "--login-server="+n1.env.ControlURL(), "--hostname=foo").Run(); err != nil {
 		t.Fatalf("up: %v", err)
 	}
 
@@ -283,11 +264,11 @@ func TestStateSavedOnStart(t *testing.T) {
 func TestOneNodeUpAuth(t *testing.T) {
 	tstest.Shard(t)
 	tstest.Parallel(t)
-	env := newTestEnv(t, configureControl(func(control *testcontrol.Server) {
+	env := NewTestEnv(t, ConfigureControl(func(control *testcontrol.Server) {
 		control.RequireAuth = true
 	}))
 
-	n1 := newTestNode(t, env)
+	n1 := NewTestNode(t, env)
 	d1 := n1.StartDaemon()
 
 	n1.AwaitListening()
@@ -295,18 +276,23 @@ func TestOneNodeUpAuth(t *testing.T) {
 	st := n1.MustStatus()
 	t.Logf("Status: %s", st.BackendState)
 
-	t.Logf("Running up --login-server=%s ...", env.controlURL())
+	t.Logf("Running up --login-server=%s ...", env.ControlURL())
 
-	cmd := n1.Tailscale("up", "--login-server="+env.controlURL())
-	var authCountAtomic int32
+	cmd := n1.Tailscale("up", "--login-server="+env.ControlURL())
+	var authCountAtomic atomic.Int32
 	cmd.Stdout = &authURLParserWriter{fn: func(urlStr string) error {
+		t.Logf("saw auth URL %q", urlStr)
 		if env.Control.CompleteAuth(urlStr) {
-			atomic.AddInt32(&authCountAtomic, 1)
+			if authCountAtomic.Add(1) > 1 {
+				err := errors.New("completed multple auth URLs")
+				t.Error(err)
+				return err
+			}
 			t.Logf("completed auth path %s", urlStr)
 			return nil
 		}
 		err := fmt.Errorf("Failed to complete auth path to %q", urlStr)
-		t.Log(err)
+		t.Error(err)
 		return err
 	}}
 	cmd.Stderr = cmd.Stdout
@@ -317,7 +303,7 @@ func TestOneNodeUpAuth(t *testing.T) {
 
 	n1.AwaitRunning()
 
-	if n := atomic.LoadInt32(&authCountAtomic); n != 1 {
+	if n := authCountAtomic.Load(); n != 1 {
 		t.Errorf("Auth URLs completed = %d; want 1", n)
 	}
 
@@ -329,11 +315,11 @@ func TestConfigFileAuthKey(t *testing.T) {
 	tstest.Shard(t)
 	t.Parallel()
 	const authKey = "opensesame"
-	env := newTestEnv(t, configureControl(func(control *testcontrol.Server) {
+	env := NewTestEnv(t, ConfigureControl(func(control *testcontrol.Server) {
 		control.RequireAuthKey = authKey
 	}))
 
-	n1 := newTestNode(t, env)
+	n1 := NewTestNode(t, env)
 	n1.configFile = filepath.Join(n1.dir, "config.json")
 	authKeyFile := filepath.Join(n1.dir, "my-auth-key")
 	must.Do(os.WriteFile(authKeyFile, fmt.Appendf(nil, "%s\n", authKey), 0666))
@@ -354,14 +340,14 @@ func TestConfigFileAuthKey(t *testing.T) {
 func TestTwoNodes(t *testing.T) {
 	tstest.Shard(t)
 	tstest.Parallel(t)
-	env := newTestEnv(t)
+	env := NewTestEnv(t)
 
 	// Create two nodes:
-	n1 := newTestNode(t, env)
+	n1 := NewTestNode(t, env)
 	n1SocksAddrCh := n1.socks5AddrChan()
 	d1 := n1.StartDaemon()
 
-	n2 := newTestNode(t, env)
+	n2 := NewTestNode(t, env)
 	n2SocksAddrCh := n2.socks5AddrChan()
 	d2 := n2.StartDaemon()
 
@@ -380,7 +366,7 @@ func TestTwoNodes(t *testing.T) {
 		defer n2.mu.Unlock()
 
 		rxNoDates := regexp.MustCompile(`(?m)^\d{4}.\d{2}.\d{2}.\d{2}:\d{2}:\d{2}`)
-		cleanLog := func(n *testNode) []byte {
+		cleanLog := func(n *TestNode) []byte {
 			b := n.tailscaledParser.allBuf.Bytes()
 			b = rxNoDates.ReplaceAll(b, nil)
 			return b
@@ -440,10 +426,10 @@ func TestTwoNodes(t *testing.T) {
 func TestIncrementalMapUpdatePeersRemoved(t *testing.T) {
 	tstest.Shard(t)
 	tstest.Parallel(t)
-	env := newTestEnv(t)
+	env := NewTestEnv(t)
 
 	// Create one node:
-	n1 := newTestNode(t, env)
+	n1 := NewTestNode(t, env)
 	d1 := n1.StartDaemon()
 	n1.AwaitListening()
 	n1.MustUp()
@@ -455,7 +441,7 @@ func TestIncrementalMapUpdatePeersRemoved(t *testing.T) {
 	}
 	tnode1 := all[0]
 
-	n2 := newTestNode(t, env)
+	n2 := NewTestNode(t, env)
 	d2 := n2.StartDaemon()
 	n2.AwaitListening()
 	n2.MustUp()
@@ -525,8 +511,8 @@ func TestNodeAddressIPFields(t *testing.T) {
 	tstest.Shard(t)
 	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/7008")
 	tstest.Parallel(t)
-	env := newTestEnv(t)
-	n1 := newTestNode(t, env)
+	env := NewTestEnv(t)
+	n1 := NewTestNode(t, env)
 	d1 := n1.StartDaemon()
 
 	n1.AwaitListening()
@@ -552,8 +538,8 @@ func TestNodeAddressIPFields(t *testing.T) {
 func TestAddPingRequest(t *testing.T) {
 	tstest.Shard(t)
 	tstest.Parallel(t)
-	env := newTestEnv(t)
-	n1 := newTestNode(t, env)
+	env := NewTestEnv(t)
+	n1 := NewTestNode(t, env)
 	n1.StartDaemon()
 
 	n1.AwaitListening()
@@ -606,7 +592,7 @@ func TestC2NPingRequest(t *testing.T) {
 	tstest.Shard(t)
 	tstest.Parallel(t)
 
-	env := newTestEnv(t)
+	env := NewTestEnv(t)
 
 	gotPing := make(chan bool, 1)
 	env.Control.HandleC2N = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -624,7 +610,7 @@ func TestC2NPingRequest(t *testing.T) {
 		gotPing <- true
 	})
 
-	n1 := newTestNode(t, env)
+	n1 := NewTestNode(t, env)
 	n1.StartDaemon()
 
 	n1.AwaitListening()
@@ -677,8 +663,8 @@ func TestC2NPingRequest(t *testing.T) {
 func TestNoControlConnWhenDown(t *testing.T) {
 	tstest.Shard(t)
 	tstest.Parallel(t)
-	env := newTestEnv(t)
-	n1 := newTestNode(t, env)
+	env := NewTestEnv(t)
+	n1 := NewTestNode(t, env)
 
 	d1 := n1.StartDaemon()
 	n1.AwaitResponding()
@@ -716,8 +702,8 @@ func TestNoControlConnWhenDown(t *testing.T) {
 func TestOneNodeUpWindowsStyle(t *testing.T) {
 	tstest.Shard(t)
 	tstest.Parallel(t)
-	env := newTestEnv(t)
-	n1 := newTestNode(t, env)
+	env := NewTestEnv(t)
+	n1 := NewTestNode(t, env)
 	n1.upFlagGOOS = "windows"
 
 	d1 := n1.StartDaemonAsIPNGOOS("windows")
@@ -736,9 +722,9 @@ func TestOneNodeUpWindowsStyle(t *testing.T) {
 func TestClientSideJailing(t *testing.T) {
 	tstest.Shard(t)
 	tstest.Parallel(t)
-	env := newTestEnv(t)
-	registerNode := func() (*testNode, key.NodePublic) {
-		n := newTestNode(t, env)
+	env := NewTestEnv(t)
+	registerNode := func() (*TestNode, key.NodePublic) {
+		n := NewTestNode(t, env)
 		n.StartDaemon()
 		n.AwaitListening()
 		n.MustUp()
@@ -852,9 +838,9 @@ func TestNATPing(t *testing.T) {
 	tstest.Shard(t)
 	tstest.Parallel(t)
 	for _, v6 := range []bool{false, true} {
-		env := newTestEnv(t)
-		registerNode := func() (*testNode, key.NodePublic) {
-			n := newTestNode(t, env)
+		env := NewTestEnv(t)
+		registerNode := func() (*TestNode, key.NodePublic) {
+			n := NewTestNode(t, env)
 			n.StartDaemon()
 			n.AwaitListening()
 			n.MustUp()
@@ -979,11 +965,11 @@ func TestNATPing(t *testing.T) {
 func TestLogoutRemovesAllPeers(t *testing.T) {
 	tstest.Shard(t)
 	tstest.Parallel(t)
-	env := newTestEnv(t)
+	env := NewTestEnv(t)
 	// Spin up some nodes.
-	nodes := make([]*testNode, 2)
+	nodes := make([]*TestNode, 2)
 	for i := range nodes {
-		nodes[i] = newTestNode(t, env)
+		nodes[i] = NewTestNode(t, env)
 		nodes[i].StartDaemon()
 		nodes[i].AwaitResponding()
 		nodes[i].MustUp()
@@ -1037,9 +1023,9 @@ func TestAutoUpdateDefaults(t *testing.T) {
 	}
 	tstest.Shard(t)
 	tstest.Parallel(t)
-	env := newTestEnv(t)
+	env := NewTestEnv(t)
 
-	checkDefault := func(n *testNode, want bool) error {
+	checkDefault := func(n *TestNode, want bool) error {
 		enabled, ok := n.diskPrefs().AutoUpdate.Apply.Get()
 		if !ok {
 			return fmt.Errorf("auto-update for node is unset, should be set as %v", want)
@@ -1050,7 +1036,7 @@ func TestAutoUpdateDefaults(t *testing.T) {
 		return nil
 	}
 
-	sendAndCheckDefault := func(t *testing.T, n *testNode, send, want bool) {
+	sendAndCheckDefault := func(t *testing.T, n *TestNode, send, want bool) {
 		t.Helper()
 		if !env.Control.AddRawMapResponse(n.MustStatus().Self.PublicKey, &tailcfg.MapResponse{
 			DefaultAutoUpdate: opt.NewBool(send),
@@ -1066,11 +1052,11 @@ func TestAutoUpdateDefaults(t *testing.T) {
 
 	tests := []struct {
 		desc string
-		run  func(t *testing.T, n *testNode)
+		run  func(t *testing.T, n *TestNode)
 	}{
 		{
 			desc: "tailnet-default-false",
-			run: func(t *testing.T, n *testNode) {
+			run: func(t *testing.T, n *TestNode) {
 				// First received default "false".
 				sendAndCheckDefault(t, n, false, false)
 				// Should not be changed even if sent "true" later.
@@ -1084,7 +1070,7 @@ func TestAutoUpdateDefaults(t *testing.T) {
 		},
 		{
 			desc: "tailnet-default-true",
-			run: func(t *testing.T, n *testNode) {
+			run: func(t *testing.T, n *TestNode) {
 				// First received default "true".
 				sendAndCheckDefault(t, n, true, true)
 				// Should not be changed even if sent "false" later.
@@ -1098,7 +1084,7 @@ func TestAutoUpdateDefaults(t *testing.T) {
 		},
 		{
 			desc: "user-sets-first",
-			run: func(t *testing.T, n *testNode) {
+			run: func(t *testing.T, n *TestNode) {
 				// User sets auto-update first, before receiving defaults.
 				if out, err := n.TailscaleForOutput("set", "--auto-update=false").CombinedOutput(); err != nil {
 					t.Fatalf("failed to disable auto-update on node: %v\noutput: %s", err, out)
@@ -1111,7 +1097,7 @@ func TestAutoUpdateDefaults(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.desc, func(t *testing.T) {
-			n := newTestNode(t, env)
+			n := NewTestNode(t, env)
 			d := n.StartDaemon()
 			defer d.MustCleanShutdown(t)
 
@@ -1133,25 +1119,16 @@ func TestDNSOverTCPIntervalResolver(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("skipping when not root")
 	}
-	env := newTestEnv(t)
+	env := NewTestEnv(t)
 	env.tunMode = true
-	n1 := newTestNode(t, env)
+	n1 := NewTestNode(t, env)
 	d1 := n1.StartDaemon()
 
 	n1.AwaitResponding()
 	n1.MustUp()
-
-	wantIP4 := n1.AwaitIP4()
 	n1.AwaitRunning()
 
-	status, err := n1.Status()
-	if err != nil {
-		t.Fatalf("failed to get node status: %v", err)
-	}
-	selfDNSName, err := dnsname.ToFQDN(status.Self.DNSName)
-	if err != nil {
-		t.Fatalf("error converting self dns name to fqdn: %v", err)
-	}
+	const dnsSymbolicFQDN = "magicdns.localhost-tailscale-daemon."
 
 	cases := []struct {
 		network     string
@@ -1167,9 +1144,9 @@ func TestDNSOverTCPIntervalResolver(t *testing.T) {
 		},
 	}
 	for _, c := range cases {
-		err = tstest.WaitFor(time.Second*5, func() error {
+		err := tstest.WaitFor(time.Second*5, func() error {
 			m := new(dns.Msg)
-			m.SetQuestion(selfDNSName.WithTrailingDot(), dns.TypeA)
+			m.SetQuestion(dnsSymbolicFQDN, dns.TypeA)
 			conn, err := net.DialTimeout(c.network, net.JoinHostPort(c.serviceAddr.String(), "53"), time.Second*1)
 			if err != nil {
 				return err
@@ -1194,8 +1171,8 @@ func TestDNSOverTCPIntervalResolver(t *testing.T) {
 				return fmt.Errorf("unexpected answer type: %s", resp.Answer[0])
 			}
 			gotAddr = answer.A
-			if !bytes.Equal(gotAddr, wantIP4.AsSlice()) {
-				return fmt.Errorf("got (%s) != want (%s)", gotAddr, wantIP4)
+			if !bytes.Equal(gotAddr, tsaddr.TailscaleServiceIP().AsSlice()) {
+				return fmt.Errorf("got (%s) != want (%s)", gotAddr, tsaddr.TailscaleServiceIP())
 			}
 			return nil
 		})
@@ -1215,12 +1192,12 @@ func TestNetstackTCPLoopback(t *testing.T) {
 		t.Skip("skipping when not root")
 	}
 
-	env := newTestEnv(t)
+	env := NewTestEnv(t)
 	env.tunMode = true
 	loopbackPort := 5201
 	env.loopbackPort = &loopbackPort
 	loopbackPortStr := strconv.Itoa(loopbackPort)
-	n1 := newTestNode(t, env)
+	n1 := NewTestNode(t, env)
 	d1 := n1.StartDaemon()
 
 	n1.AwaitResponding()
@@ -1357,11 +1334,11 @@ func TestNetstackUDPLoopback(t *testing.T) {
 		t.Skip("skipping when not root")
 	}
 
-	env := newTestEnv(t)
+	env := NewTestEnv(t)
 	env.tunMode = true
 	loopbackPort := 5201
 	env.loopbackPort = &loopbackPort
-	n1 := newTestNode(t, env)
+	n1 := NewTestNode(t, env)
 	d1 := n1.StartDaemon()
 
 	n1.AwaitResponding()
@@ -1496,580 +1473,59 @@ func TestNetstackUDPLoopback(t *testing.T) {
 	d1.MustCleanShutdown(t)
 }
 
-// testEnv contains the test environment (set of servers) used by one
-// or more nodes.
-type testEnv struct {
-	t            testing.TB
-	tunMode      bool
-	cli          string
-	daemon       string
-	loopbackPort *int
-
-	LogCatcher       *LogCatcher
-	LogCatcherServer *httptest.Server
-
-	Control       *testcontrol.Server
-	ControlServer *httptest.Server
-
-	TrafficTrap       *trafficTrap
-	TrafficTrapServer *httptest.Server
-}
-
-// controlURL returns e.ControlServer.URL, panicking if it's the empty string,
-// which it should never be in tests.
-func (e *testEnv) controlURL() string {
-	s := e.ControlServer.URL
-	if s == "" {
-		panic("control server not set")
+func TestEncryptStateMigration(t *testing.T) {
+	if !hostinfo.New().TPM.Present() {
+		t.Skip("TPM not available")
 	}
-	return s
-}
-
-type testEnvOpt interface {
-	modifyTestEnv(*testEnv)
-}
-
-type configureControl func(*testcontrol.Server)
-
-func (f configureControl) modifyTestEnv(te *testEnv) {
-	f(te.Control)
-}
-
-// newTestEnv starts a bunch of services and returns a new test environment.
-// newTestEnv arranges for the environment's resources to be cleaned up on exit.
-func newTestEnv(t testing.TB, opts ...testEnvOpt) *testEnv {
-	if runtime.GOOS == "windows" {
-		t.Skip("not tested/working on Windows yet")
+	if runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+		t.Skip("--encrypt-state for tailscaled state not supported on this platform")
 	}
-	derpMap := RunDERPAndSTUN(t, logger.Discard, "127.0.0.1")
-	logc := new(LogCatcher)
-	control := &testcontrol.Server{
-		DERPMap: derpMap,
-	}
-	control.HTTPTestServer = httptest.NewUnstartedServer(control)
-	trafficTrap := new(trafficTrap)
-	e := &testEnv{
-		t:                 t,
-		cli:               TailscaleBinary(t),
-		daemon:            TailscaledBinary(t),
-		LogCatcher:        logc,
-		LogCatcherServer:  httptest.NewServer(logc),
-		Control:           control,
-		ControlServer:     control.HTTPTestServer,
-		TrafficTrap:       trafficTrap,
-		TrafficTrapServer: httptest.NewServer(trafficTrap),
-	}
-	for _, o := range opts {
-		o.modifyTestEnv(e)
-	}
-	control.HTTPTestServer.Start()
-	t.Cleanup(func() {
-		// Shut down e.
-		if err := e.TrafficTrap.Err(); err != nil {
-			e.t.Errorf("traffic trap: %v", err)
-			e.t.Logf("logs: %s", e.LogCatcher.logsString())
-		}
-		e.LogCatcherServer.Close()
-		e.TrafficTrapServer.Close()
-		e.ControlServer.Close()
-	})
-	t.Logf("control URL: %v", e.controlURL())
-	return e
-}
+	tstest.Shard(t)
+	tstest.Parallel(t)
+	env := NewTestEnv(t)
+	n := NewTestNode(t, env)
 
-// testNode is a machine with a tailscale & tailscaled.
-// Currently, the test is simplistic and user==node==machine.
-// That may grow complexity later to test more.
-type testNode struct {
-	env              *testEnv
-	tailscaledParser *nodeOutputParser
+	runNode := func(t *testing.T, wantStateKeys []string) {
+		t.Helper()
 
-	dir        string // temp dir for sock & state
-	configFile string // or empty for none
-	sockFile   string
-	stateFile  string
-	upFlagGOOS string // if non-empty, sets TS_DEBUG_UP_FLAG_GOOS for cmd/tailscale CLI
+		// Run the node.
+		d := n.StartDaemon()
+		n.AwaitResponding()
+		n.MustUp()
+		n.AwaitRunning()
 
-	mu        sync.Mutex
-	onLogLine []func([]byte)
-}
-
-// newTestNode allocates a temp directory for a new test node.
-// The node is not started automatically.
-func newTestNode(t *testing.T, env *testEnv) *testNode {
-	dir := t.TempDir()
-	sockFile := filepath.Join(dir, "tailscale.sock")
-	if len(sockFile) >= 104 {
-		// Maximum length for a unix socket on darwin. Try something else.
-		sockFile = filepath.Join(os.TempDir(), rands.HexString(8)+".sock")
-		t.Cleanup(func() { os.Remove(sockFile) })
-	}
-	n := &testNode{
-		env:       env,
-		dir:       dir,
-		sockFile:  sockFile,
-		stateFile: filepath.Join(dir, "tailscale.state"),
-	}
-
-	// Look for a data race. Once we see the start marker, start logging the rest.
-	var sawRace bool
-	var sawPanic bool
-	n.addLogLineHook(func(line []byte) {
-		lineB := mem.B(line)
-		if mem.Contains(lineB, mem.S("WARNING: DATA RACE")) {
-			sawRace = true
-		}
-		if mem.HasPrefix(lineB, mem.S("panic: ")) {
-			sawPanic = true
-		}
-		if sawRace || sawPanic {
-			t.Logf("%s", line)
-		}
-	})
-
-	return n
-}
-
-func (n *testNode) diskPrefs() *ipn.Prefs {
-	t := n.env.t
-	t.Helper()
-	if _, err := os.ReadFile(n.stateFile); err != nil {
-		t.Fatalf("reading prefs: %v", err)
-	}
-	fs, err := store.NewFileStore(nil, n.stateFile)
-	if err != nil {
-		t.Fatalf("reading prefs, NewFileStore: %v", err)
-	}
-	p, err := ipnlocal.ReadStartupPrefsForTest(t.Logf, fs)
-	if err != nil {
-		t.Fatalf("reading prefs, ReadDiskPrefsForTest: %v", err)
-	}
-	return p.AsStruct()
-}
-
-// AwaitResponding waits for n's tailscaled to be up enough to be
-// responding, but doesn't wait for any particular state.
-func (n *testNode) AwaitResponding() {
-	t := n.env.t
-	t.Helper()
-	n.AwaitListening()
-
-	st := n.MustStatus()
-	t.Logf("Status: %s", st.BackendState)
-
-	if err := tstest.WaitFor(20*time.Second, func() error {
-		const sub = `Program starting: `
-		if !n.env.LogCatcher.logsContains(mem.S(sub)) {
-			return fmt.Errorf("log catcher didn't see %#q; got %s", sub, n.env.LogCatcher.logsString())
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// addLogLineHook registers a hook f to be called on each tailscaled
-// log line output.
-func (n *testNode) addLogLineHook(f func([]byte)) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.onLogLine = append(n.onLogLine, f)
-}
-
-// socks5AddrChan returns a channel that receives the address (e.g. "localhost:23874")
-// of the node's SOCKS5 listener, once started.
-func (n *testNode) socks5AddrChan() <-chan string {
-	ch := make(chan string, 1)
-	n.addLogLineHook(func(line []byte) {
-		const sub = "SOCKS5 listening on "
-		i := mem.Index(mem.B(line), mem.S(sub))
-		if i == -1 {
-			return
-		}
-		addr := strings.TrimSpace(string(line)[i+len(sub):])
-		select {
-		case ch <- addr:
-		default:
-		}
-	})
-	return ch
-}
-
-func (n *testNode) AwaitSocksAddr(ch <-chan string) string {
-	t := n.env.t
-	t.Helper()
-	timer := time.NewTimer(10 * time.Second)
-	defer timer.Stop()
-	select {
-	case v := <-ch:
-		return v
-	case <-timer.C:
-		t.Fatal("timeout waiting for node to log its SOCK5 listening address")
-		panic("unreachable")
-	}
-}
-
-// nodeOutputParser parses stderr of tailscaled processes, calling the
-// per-line callbacks previously registered via
-// testNode.addLogLineHook.
-type nodeOutputParser struct {
-	allBuf      bytes.Buffer
-	pendLineBuf bytes.Buffer
-	n           *testNode
-}
-
-func (op *nodeOutputParser) Write(p []byte) (n int, err error) {
-	tn := op.n
-	tn.mu.Lock()
-	defer tn.mu.Unlock()
-
-	op.allBuf.Write(p)
-	n, err = op.pendLineBuf.Write(p)
-	op.parseLinesLocked()
-	return
-}
-
-func (op *nodeOutputParser) parseLinesLocked() {
-	n := op.n
-	buf := op.pendLineBuf.Bytes()
-	for len(buf) > 0 {
-		nl := bytes.IndexByte(buf, '\n')
-		if nl == -1 {
-			break
-		}
-		line := buf[:nl+1]
-		buf = buf[nl+1:]
-
-		for _, f := range n.onLogLine {
-			f(line)
-		}
-	}
-	if len(buf) == 0 {
-		op.pendLineBuf.Reset()
-	} else {
-		io.CopyN(io.Discard, &op.pendLineBuf, int64(op.pendLineBuf.Len()-len(buf)))
-	}
-}
-
-type Daemon struct {
-	Process *os.Process
-}
-
-func (d *Daemon) MustCleanShutdown(t testing.TB) {
-	d.Process.Signal(os.Interrupt)
-	ps, err := d.Process.Wait()
-	if err != nil {
-		t.Fatalf("tailscaled Wait: %v", err)
-	}
-	if ps.ExitCode() != 0 {
-		t.Errorf("tailscaled ExitCode = %d; want 0", ps.ExitCode())
-	}
-}
-
-// StartDaemon starts the node's tailscaled, failing if it fails to start.
-// StartDaemon ensures that the process will exit when the test completes.
-func (n *testNode) StartDaemon() *Daemon {
-	return n.StartDaemonAsIPNGOOS(runtime.GOOS)
-}
-
-func (n *testNode) StartDaemonAsIPNGOOS(ipnGOOS string) *Daemon {
-	t := n.env.t
-	cmd := exec.Command(n.env.daemon)
-	cmd.Args = append(cmd.Args,
-		"--state="+n.stateFile,
-		"--socket="+n.sockFile,
-		"--socks5-server=localhost:0",
-	)
-	if *verboseTailscaled {
-		cmd.Args = append(cmd.Args, "-verbose=2")
-	}
-	if !n.env.tunMode {
-		cmd.Args = append(cmd.Args,
-			"--tun=userspace-networking",
-		)
-	}
-	if n.configFile != "" {
-		cmd.Args = append(cmd.Args, "--config="+n.configFile)
-	}
-	cmd.Env = append(os.Environ(),
-		"TS_CONTROL_IS_PLAINTEXT_HTTP=1",
-		"TS_DEBUG_PERMIT_HTTP_C2N=1",
-		"TS_LOG_TARGET="+n.env.LogCatcherServer.URL,
-		"HTTP_PROXY="+n.env.TrafficTrapServer.URL,
-		"HTTPS_PROXY="+n.env.TrafficTrapServer.URL,
-		"TS_DEBUG_FAKE_GOOS="+ipnGOOS,
-		"TS_LOGS_DIR="+t.TempDir(),
-		"TS_NETCHECK_GENERATE_204_URL="+n.env.ControlServer.URL+"/generate_204",
-		"TS_ASSUME_NETWORK_UP_FOR_TEST=1", // don't pause control client in airplane mode (no wifi, etc)
-		"TS_PANIC_IF_HIT_MAIN_CONTROL=1",
-		"TS_DISABLE_PORTMAPPER=1", // shouldn't be needed; test is all localhost
-		"TS_DEBUG_LOG_RATE=all",
-	)
-	if n.env.loopbackPort != nil {
-		cmd.Env = append(cmd.Env, "TS_DEBUG_NETSTACK_LOOPBACK_PORT="+strconv.Itoa(*n.env.loopbackPort))
-	}
-	if version.IsRace() {
-		cmd.Env = append(cmd.Env, "GORACE=halt_on_error=1")
-	}
-	n.tailscaledParser = &nodeOutputParser{n: n}
-	cmd.Stderr = n.tailscaledParser
-	if *verboseTailscaled {
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = io.MultiWriter(cmd.Stderr, os.Stderr)
-	}
-	if runtime.GOOS != "windows" {
-		pr, pw, err := os.Pipe()
+		// Check the contents of the state file.
+		buf, err := os.ReadFile(n.stateFile)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("reading %q: %v", n.stateFile, err)
 		}
-		t.Cleanup(func() { pw.Close() })
-		cmd.ExtraFiles = append(cmd.ExtraFiles, pr)
-		cmd.Env = append(cmd.Env, "TS_PARENT_DEATH_FD=3")
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("starting tailscaled: %v", err)
-	}
-	t.Cleanup(func() { cmd.Process.Kill() })
-	return &Daemon{
-		Process: cmd.Process,
-	}
-}
-
-func (n *testNode) MustUp(extraArgs ...string) {
-	t := n.env.t
-	t.Helper()
-	args := []string{
-		"up",
-		"--login-server=" + n.env.controlURL(),
-		"--reset",
-	}
-	args = append(args, extraArgs...)
-	cmd := n.Tailscale(args...)
-	t.Logf("Running %v ...", cmd)
-	cmd.Stdout = nil // in case --verbose-tailscale was set
-	cmd.Stderr = nil // in case --verbose-tailscale was set
-	if b, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("up: %v, %v", string(b), err)
-	}
-}
-
-func (n *testNode) MustDown() {
-	t := n.env.t
-	t.Logf("Running down ...")
-	if err := n.Tailscale("down", "--accept-risk=all").Run(); err != nil {
-		t.Fatalf("down: %v", err)
-	}
-}
-
-func (n *testNode) MustLogOut() {
-	t := n.env.t
-	t.Logf("Running logout ...")
-	if err := n.Tailscale("logout").Run(); err != nil {
-		t.Fatalf("logout: %v", err)
-	}
-}
-
-func (n *testNode) Ping(otherNode *testNode) error {
-	t := n.env.t
-	ip := otherNode.AwaitIP4().String()
-	t.Logf("Running ping %v (from %v)...", ip, n.AwaitIP4())
-	return n.Tailscale("ping", ip).Run()
-}
-
-// AwaitListening waits for the tailscaled to be serving local clients
-// over its localhost IPC mechanism. (Unix socket, etc)
-func (n *testNode) AwaitListening() {
-	t := n.env.t
-	if err := tstest.WaitFor(20*time.Second, func() (err error) {
-		c, err := safesocket.ConnectContext(context.Background(), n.sockFile)
-		if err == nil {
-			c.Close()
+		t.Logf("state file content:\n%s", buf)
+		var content map[string]any
+		if err := json.Unmarshal(buf, &content); err != nil {
+			t.Fatalf("parsing %q: %v", n.stateFile, err)
 		}
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func (n *testNode) AwaitIPs() []netip.Addr {
-	t := n.env.t
-	t.Helper()
-	var addrs []netip.Addr
-	if err := tstest.WaitFor(20*time.Second, func() error {
-		cmd := n.Tailscale("ip")
-		cmd.Stdout = nil // in case --verbose-tailscale was set
-		cmd.Stderr = nil // in case --verbose-tailscale was set
-		out, err := cmd.Output()
-		if err != nil {
-			return err
-		}
-		ips := string(out)
-		ipslice := strings.Fields(ips)
-		addrs = make([]netip.Addr, len(ipslice))
-
-		for i, ip := range ipslice {
-			netIP, err := netip.ParseAddr(ip)
-			if err != nil {
-				t.Fatal(err)
+		for _, k := range wantStateKeys {
+			if _, ok := content[k]; !ok {
+				t.Errorf("state file is missing key %q", k)
 			}
-			addrs[i] = netIP
 		}
-		return nil
-	}); err != nil {
-		t.Fatalf("awaiting an IP address: %v", err)
+
+		// Stop the node.
+		d.MustCleanShutdown(t)
 	}
-	if len(addrs) == 0 {
-		t.Fatalf("returned IP address was blank")
-	}
-	return addrs
-}
 
-// AwaitIP4 returns the IPv4 address of n.
-func (n *testNode) AwaitIP4() netip.Addr {
-	t := n.env.t
-	t.Helper()
-	ips := n.AwaitIPs()
-	return ips[0]
-}
-
-// AwaitIP6 returns the IPv6 address of n.
-func (n *testNode) AwaitIP6() netip.Addr {
-	t := n.env.t
-	t.Helper()
-	ips := n.AwaitIPs()
-	return ips[1]
-}
-
-// AwaitRunning waits for n to reach the IPN state "Running".
-func (n *testNode) AwaitRunning() {
-	n.AwaitBackendState("Running")
-}
-
-func (n *testNode) AwaitBackendState(state string) {
-	t := n.env.t
-	t.Helper()
-	if err := tstest.WaitFor(20*time.Second, func() error {
-		st, err := n.Status()
-		if err != nil {
-			return err
-		}
-		if st.BackendState != state {
-			return fmt.Errorf("in state %q; want %q", st.BackendState, state)
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("failure/timeout waiting for transition to Running status: %v", err)
-	}
-}
-
-// AwaitNeedsLogin waits for n to reach the IPN state "NeedsLogin".
-func (n *testNode) AwaitNeedsLogin() {
-	t := n.env.t
-	t.Helper()
-	if err := tstest.WaitFor(20*time.Second, func() error {
-		st, err := n.Status()
-		if err != nil {
-			return err
-		}
-		if st.BackendState != "NeedsLogin" {
-			return fmt.Errorf("in state %q", st.BackendState)
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("failure/timeout waiting for transition to NeedsLogin status: %v", err)
-	}
-}
-
-func (n *testNode) TailscaleForOutput(arg ...string) *exec.Cmd {
-	cmd := n.Tailscale(arg...)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	return cmd
-}
-
-// Tailscale returns a command that runs the tailscale CLI with the provided arguments.
-// It does not start the process.
-func (n *testNode) Tailscale(arg ...string) *exec.Cmd {
-	cmd := exec.Command(n.env.cli)
-	cmd.Args = append(cmd.Args, "--socket="+n.sockFile)
-	cmd.Args = append(cmd.Args, arg...)
-	cmd.Dir = n.dir
-	cmd.Env = append(os.Environ(),
-		"TS_DEBUG_UP_FLAG_GOOS="+n.upFlagGOOS,
-		"TS_LOGS_DIR="+n.env.t.TempDir(),
-	)
-	if *verboseTailscale {
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-	}
-	return cmd
-}
-
-func (n *testNode) Status() (*ipnstate.Status, error) {
-	cmd := n.Tailscale("status", "--json")
-	cmd.Stdout = nil // in case --verbose-tailscale was set
-	cmd.Stderr = nil // in case --verbose-tailscale was set
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("running tailscale status: %v, %s", err, out)
-	}
-	st := new(ipnstate.Status)
-	if err := json.Unmarshal(out, st); err != nil {
-		return nil, fmt.Errorf("decoding tailscale status JSON: %w", err)
-	}
-	return st, nil
-}
-
-func (n *testNode) MustStatus() *ipnstate.Status {
-	tb := n.env.t
-	tb.Helper()
-	st, err := n.Status()
-	if err != nil {
-		tb.Fatal(err)
-	}
-	return st
-}
-
-// trafficTrap is an HTTP proxy handler to note whether any
-// HTTP traffic tries to leave localhost from tailscaled. We don't
-// expect any, so any request triggers a failure.
-type trafficTrap struct {
-	atomicErr syncs.AtomicValue[error]
-}
-
-func (tt *trafficTrap) Err() error {
-	return tt.atomicErr.Load()
-}
-
-func (tt *trafficTrap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	var got bytes.Buffer
-	r.Write(&got)
-	err := fmt.Errorf("unexpected HTTP request via proxy: %s", got.Bytes())
-	mainError.Store(err)
-	if tt.Err() == nil {
-		// Best effort at remembering the first request.
-		tt.atomicErr.Store(err)
-	}
-	log.Printf("Error: %v", err)
-	w.WriteHeader(403)
-}
-
-type authURLParserWriter struct {
-	buf bytes.Buffer
-	fn  func(urlStr string) error
-}
-
-var authURLRx = regexp.MustCompile(`(https?://\S+/auth/\S+)`)
-
-func (w *authURLParserWriter) Write(p []byte) (n int, err error) {
-	n, err = w.buf.Write(p)
-	m := authURLRx.FindSubmatch(w.buf.Bytes())
-	if m != nil {
-		urlStr := string(m[1])
-		w.buf.Reset() // so it's not matched again
-		if err := w.fn(urlStr); err != nil {
-			return 0, err
-		}
-	}
-	return n, err
+	wantPlaintextStateKeys := []string{"_machinekey", "_current-profile", "_profiles"}
+	wantEncryptedStateKeys := []string{"key", "nonce", "data"}
+	t.Run("regular-state", func(t *testing.T) {
+		n.encryptState = false
+		runNode(t, wantPlaintextStateKeys)
+	})
+	t.Run("migrate-to-encrypted", func(t *testing.T) {
+		n.encryptState = true
+		runNode(t, wantEncryptedStateKeys)
+	})
+	t.Run("migrate-to-plaintext", func(t *testing.T) {
+		n.encryptState = false
+		runNode(t, wantPlaintextStateKeys)
+	})
 }

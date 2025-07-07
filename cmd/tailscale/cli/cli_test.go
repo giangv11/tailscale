@@ -605,7 +605,7 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			want: "",
 		},
 		{
-			name:  "losing_posture_checking",
+			name:  "losing_report_posture",
 			flags: []string{"--accept-dns"},
 			curPrefs: &ipn.Prefs{
 				ControlURL:          ipn.DefaultControlURL,
@@ -615,7 +615,7 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 				NetfilterMode:       preftype.NetfilterOn,
 				NoStatefulFiltering: opt.NewBool(true),
 			},
-			want: accidentalUpPrefix + " --accept-dns --posture-checking",
+			want: accidentalUpPrefix + " --accept-dns --report-posture",
 		},
 	}
 	for _, tt := range tests {
@@ -970,6 +970,10 @@ func TestPrefFlagMapping(t *testing.T) {
 		case "InternalExitNodePrior":
 			// Used internally by LocalBackend as part of exit node usage toggling.
 			// No CLI flag for this.
+			continue
+		case "AutoExitNode":
+			// TODO(nickkhyl): should be handled by tailscale {set,up} --exit-node.
+			// See tailscale/tailscale#16459.
 			continue
 		}
 		t.Errorf("unexpected new ipn.Pref field %q is not handled by up.go (see addPrefFlagMapping and checkForAccidentalSettingReverts)", prefName)
@@ -1394,23 +1398,28 @@ var cmpIP = cmp.Comparer(func(a, b netip.Addr) bool {
 })
 
 func TestCleanUpArgs(t *testing.T) {
+	type S = []string
 	c := qt.New(t)
 	tests := []struct {
 		in   []string
 		want []string
 	}{
-		{in: []string{"something"}, want: []string{"something"}},
-		{in: []string{}, want: []string{}},
-		{in: []string{"--authkey=0"}, want: []string{"--auth-key=0"}},
-		{in: []string{"a", "--authkey=1", "b"}, want: []string{"a", "--auth-key=1", "b"}},
-		{in: []string{"a", "--auth-key=2", "b"}, want: []string{"a", "--auth-key=2", "b"}},
-		{in: []string{"a", "-authkey=3", "b"}, want: []string{"a", "--auth-key=3", "b"}},
-		{in: []string{"a", "-auth-key=4", "b"}, want: []string{"a", "-auth-key=4", "b"}},
-		{in: []string{"a", "--authkey", "5", "b"}, want: []string{"a", "--auth-key", "5", "b"}},
-		{in: []string{"a", "-authkey", "6", "b"}, want: []string{"a", "--auth-key", "6", "b"}},
-		{in: []string{"a", "authkey", "7", "b"}, want: []string{"a", "authkey", "7", "b"}},
-		{in: []string{"--authkeyexpiry", "8"}, want: []string{"--authkeyexpiry", "8"}},
-		{in: []string{"--auth-key-expiry", "9"}, want: []string{"--auth-key-expiry", "9"}},
+		{in: S{"something"}, want: S{"something"}},
+		{in: S{}, want: S{}},
+		{in: S{"--authkey=0"}, want: S{"--auth-key=0"}},
+		{in: S{"a", "--authkey=1", "b"}, want: S{"a", "--auth-key=1", "b"}},
+		{in: S{"a", "--auth-key=2", "b"}, want: S{"a", "--auth-key=2", "b"}},
+		{in: S{"a", "-authkey=3", "b"}, want: S{"a", "--auth-key=3", "b"}},
+		{in: S{"a", "-auth-key=4", "b"}, want: S{"a", "-auth-key=4", "b"}},
+		{in: S{"a", "--authkey", "5", "b"}, want: S{"a", "--auth-key", "5", "b"}},
+		{in: S{"a", "-authkey", "6", "b"}, want: S{"a", "--auth-key", "6", "b"}},
+		{in: S{"a", "authkey", "7", "b"}, want: S{"a", "authkey", "7", "b"}},
+		{in: S{"--authkeyexpiry", "8"}, want: S{"--authkeyexpiry", "8"}},
+		{in: S{"--auth-key-expiry", "9"}, want: S{"--auth-key-expiry", "9"}},
+
+		{in: S{"--posture-checking"}, want: S{"--report-posture"}},
+		{in: S{"-posture-checking"}, want: S{"--report-posture"}},
+		{in: S{"--posture-checking=nein"}, want: S{"--report-posture=nein"}},
 	}
 
 	for _, tt := range tests {
@@ -1494,6 +1503,51 @@ func TestParseNLArgs(t *testing.T) {
 			}
 			if !reflect.DeepEqual(disablements, tc.wantDisablements) {
 				t.Errorf("disablements = %v, want %v", disablements, tc.wantDisablements)
+			}
+		})
+	}
+}
+
+// makeQuietContinueOnError modifies c recursively to make all the
+// flagsets have error mode flag.ContinueOnError and not
+// spew all over stderr.
+func makeQuietContinueOnError(c *ffcli.Command) {
+	if c.FlagSet != nil {
+		c.FlagSet.Init(c.Name, flag.ContinueOnError)
+		c.FlagSet.Usage = func() {}
+		c.FlagSet.SetOutput(io.Discard)
+	}
+	c.UsageFunc = func(*ffcli.Command) string { return "" }
+	for _, sub := range c.Subcommands {
+		makeQuietContinueOnError(sub)
+	}
+}
+
+// see tailscale/tailscale#6813
+func TestNoDups(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "dup-boolean",
+			args: []string{"up", "--json", "--json"},
+			want: "error parsing commandline arguments: invalid boolean flag json: flag provided multiple times",
+		},
+		{
+			name: "dup-string",
+			args: []string{"up", "--hostname=foo", "--hostname=bar"},
+			want: "error parsing commandline arguments: invalid value \"bar\" for flag -hostname: flag provided multiple times",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := newRootCmd()
+			makeQuietContinueOnError(cmd)
+			err := cmd.Parse(tt.args)
+			if got := fmt.Sprint(err); got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
 			}
 		})
 	}

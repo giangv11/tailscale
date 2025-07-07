@@ -1175,6 +1175,16 @@ func TestRequireTailscaleIP(t *testing.T) {
 			target:      "http://[fd7a:115c:a1e0::53]/",
 			wantHandled: false,
 		},
+		{
+			name:        "quad-100:80",
+			target:      "http://100.100.100.100:80/",
+			wantHandled: false,
+		},
+		{
+			name:        "ipv6-service-addr:80",
+			target:      "http://[fd7a:115c:a1e0::53]:80/",
+			wantHandled: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1475,5 +1485,103 @@ func mockWaitAuthURL(_ context.Context, id string, src tailcfg.NodeID) (*tailcfg
 		return nil, errors.New("authenticated as wrong user")
 	default:
 		return nil, errors.New("unknown id")
+	}
+}
+
+func TestCSRFProtect(t *testing.T) {
+	tests := []struct {
+		name           string
+		method         string
+		secFetchSite   string
+		host           string
+		origin         string
+		originOverride string
+		wantError      bool
+	}{
+		{
+			name:   "GET requests with no header are allowed",
+			method: "GET",
+		},
+		{
+			name:         "POST requests with same-origin are allowed",
+			method:       "POST",
+			secFetchSite: "same-origin",
+		},
+		{
+			name:         "POST requests with cross-site are not allowed",
+			method:       "POST",
+			secFetchSite: "cross-site",
+			wantError:    true,
+		},
+		{
+			name:         "POST requests with unknown sec-fetch-site values are not allowed",
+			method:       "POST",
+			secFetchSite: "new-unknown-value",
+			wantError:    true,
+		},
+		{
+			name:         "POST requests with none are not allowed",
+			method:       "POST",
+			secFetchSite: "none",
+			wantError:    true,
+		},
+		{
+			name:   "POST requests with no sec-fetch-site header but matching host and origin are allowed",
+			method: "POST",
+			host:   "example.com",
+			origin: "https://example.com",
+		},
+		{
+			name:      "POST requests with no sec-fetch-site and non-matching host and origin are not allowed",
+			method:    "POST",
+			host:      "example.com",
+			origin:    "https://example.net",
+			wantError: true,
+		},
+		{
+			name:           "POST requests with no sec-fetch-site and and origin that matches the override are allowed",
+			method:         "POST",
+			originOverride: "example.net",
+			host:           "internal.example.foo", // Host can be changed by reverse proxies
+			origin:         "http://example.net",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprintf(w, "OK")
+			})
+
+			s := &Server{
+				originOverride: tt.originOverride,
+			}
+			withCSRF := s.csrfProtect(handler)
+
+			r := httptest.NewRequest(tt.method, "http://example.com/", nil)
+			if tt.secFetchSite != "" {
+				r.Header.Set("Sec-Fetch-Site", tt.secFetchSite)
+			}
+			if tt.host != "" {
+				r.Host = tt.host
+			}
+			if tt.origin != "" {
+				r.Header.Set("Origin", tt.origin)
+			}
+
+			w := httptest.NewRecorder()
+			withCSRF.ServeHTTP(w, r)
+			res := w.Result()
+			defer res.Body.Close()
+			if tt.wantError {
+				if res.StatusCode != http.StatusForbidden {
+					t.Errorf("expected status forbidden, got %v", res.StatusCode)
+				}
+				return
+			}
+			if res.StatusCode != http.StatusOK {
+				t.Errorf("expected status ok, got %v", res.StatusCode)
+			}
+		})
 	}
 }

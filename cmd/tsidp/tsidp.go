@@ -11,6 +11,7 @@ import (
 	"context"
 	crand "crypto/rand"
 	"crypto/rsa"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -64,6 +65,7 @@ var (
 	flagLocalPort          = flag.Int("local-port", -1, "allow requests from localhost")
 	flagUseLocalTailscaled = flag.Bool("use-local-tailscaled", false, "use local tailscaled instead of tsnet")
 	flagFunnel             = flag.Bool("funnel", false, "use Tailscale Funnel to make tsidp available on the public internet")
+	flagHostname           = flag.String("hostname", "idp", "tsnet hostname to use instead of idp")
 	flagDir                = flag.String("dir", "", "tsnet state directory; a default one will be created if not provided")
 )
 
@@ -120,7 +122,7 @@ func main() {
 		defer cleanup()
 	} else {
 		ts := &tsnet.Server{
-			Hostname: "idp",
+			Hostname: *flagHostname,
 			Dir:      *flagDir,
 		}
 		if *flagVerbose {
@@ -159,16 +161,17 @@ func main() {
 	} else {
 		srv.serverURL = fmt.Sprintf("https://%s", strings.TrimSuffix(st.Self.DNSName, "."))
 	}
-	if *flagFunnel {
-		f, err := os.Open(funnelClientsFile)
-		if err == nil {
-			srv.funnelClients = make(map[string]*funnelClient)
-			if err := json.NewDecoder(f).Decode(&srv.funnelClients); err != nil {
-				log.Fatalf("could not parse %s: %v", funnelClientsFile, err)
-			}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			log.Fatalf("could not open %s: %v", funnelClientsFile, err)
+
+	// Load funnel clients from disk if they exist, regardless of whether funnel is enabled
+	// This ensures OIDC clients persist across restarts
+	f, err := os.Open(funnelClientsFile)
+	if err == nil {
+		if err := json.NewDecoder(f).Decode(&srv.funnelClients); err != nil {
+			log.Fatalf("could not parse %s: %v", funnelClientsFile, err)
 		}
+		f.Close()
+	} else if !errors.Is(err, os.ErrNotExist) {
+		log.Fatalf("could not open %s: %v", funnelClientsFile, err)
 	}
 
 	log.Printf("Running tsidp at %s ...", srv.serverURL)
@@ -345,7 +348,9 @@ func (ar *authRequest) allowRelyingParty(r *http.Request, lc *local.Client) erro
 			clientID = r.FormValue("client_id")
 			clientSecret = r.FormValue("client_secret")
 		}
-		if ar.funnelRP.ID != clientID || ar.funnelRP.Secret != clientSecret {
+		clientIDcmp := subtle.ConstantTimeCompare([]byte(clientID), []byte(ar.funnelRP.ID))
+		clientSecretcmp := subtle.ConstantTimeCompare([]byte(clientSecret), []byte(ar.funnelRP.Secret))
+		if clientIDcmp != 1 || clientSecretcmp != 1 {
 			return fmt.Errorf("tsidp: invalid client credentials")
 		}
 		return nil
@@ -448,13 +453,7 @@ func (s *idpServer) newMux() *http.ServeMux {
 	mux.HandleFunc("/userinfo", s.serveUserInfo)
 	mux.HandleFunc("/token", s.serveToken)
 	mux.HandleFunc("/clients/", s.serveClients)
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" {
-			io.WriteString(w, "<html><body><h1>Tailscale OIDC IdP</h1>")
-			return
-		}
-		http.Error(w, "tsidp: not found", http.StatusNotFound)
-	})
+	mux.HandleFunc("/", s.handleUI)
 	return mux
 }
 
@@ -494,6 +493,7 @@ func (s *idpServer) serveUserInfo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "tsidp: tagged nodes not supported", http.StatusBadRequest)
 		return
 	}
+
 	ui.Sub = ar.remoteUser.Node.User.String()
 	ui.Name = ar.remoteUser.UserProfile.DisplayName
 	ui.Email = ar.remoteUser.UserProfile.LoginName
@@ -502,8 +502,29 @@ func (s *idpServer) serveUserInfo(w http.ResponseWriter, r *http.Request) {
 	// TODO(maisem): not sure if this is the right thing to do
 	ui.UserName, _, _ = strings.Cut(ar.remoteUser.UserProfile.LoginName, "@")
 
+	rules, err := tailcfg.UnmarshalCapJSON[capRule](ar.remoteUser.CapMap, tailcfg.PeerCapabilityTsIDP)
+	if err != nil {
+		http.Error(w, "tsidp: failed to unmarshal capability: %v", http.StatusBadRequest)
+		return
+	}
+
+	// Only keep rules where IncludeInUserInfo is true
+	var filtered []capRule
+	for _, r := range rules {
+		if r.IncludeInUserInfo {
+			filtered = append(filtered, r)
+		}
+	}
+
+	userInfo, err := withExtraClaims(ui, filtered)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Write the final result
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(ui); err != nil {
+	if err := json.NewEncoder(w).Encode(userInfo); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -514,6 +535,140 @@ type userInfo struct {
 	Email    string `json:"email"`
 	Picture  string `json:"picture"`
 	UserName string `json:"username"`
+}
+
+type capRule struct {
+	IncludeInUserInfo bool           `json:"includeInUserInfo"`
+	ExtraClaims       map[string]any `json:"extraClaims,omitempty"` // list of features peer is allowed to edit
+}
+
+// flattenExtraClaims merges all ExtraClaims from a slice of capRule into a single map.
+// It deduplicates values for each claim and preserves the original input type:
+// scalar values remain scalars, and slices are returned as deduplicated []any slices.
+func flattenExtraClaims(rules []capRule) map[string]any {
+	// sets stores deduplicated stringified values for each claim key.
+	sets := make(map[string]map[string]struct{})
+
+	// isSlice tracks whether each claim was originally provided as a slice.
+	isSlice := make(map[string]bool)
+
+	for _, rule := range rules {
+		for claim, raw := range rule.ExtraClaims {
+			// Track whether the claim was provided as a slice
+			switch raw.(type) {
+			case []string, []any:
+				isSlice[claim] = true
+			default:
+				// Only mark as scalar if this is the first time we've seen this claim
+				if _, seen := isSlice[claim]; !seen {
+					isSlice[claim] = false
+				}
+			}
+
+			// Add the claim value(s) into the deduplication set
+			addClaimValue(sets, claim, raw)
+		}
+	}
+
+	// Build final result: either scalar or slice depending on original type
+	result := make(map[string]any)
+	for claim, valSet := range sets {
+		if isSlice[claim] {
+			// Claim was provided as a slice: output as []any
+			var vals []any
+			for val := range valSet {
+				vals = append(vals, val)
+			}
+			result[claim] = vals
+		} else {
+			// Claim was a scalar: return a single value
+			for val := range valSet {
+				result[claim] = val
+				break // only one value is expected
+			}
+		}
+	}
+
+	return result
+}
+
+// addClaimValue adds a claim value to the deduplication set for a given claim key.
+// It accepts scalars (string, int, float64), slices of strings or interfaces,
+// and recursively handles nested slices. Unsupported types are ignored with a log message.
+func addClaimValue(sets map[string]map[string]struct{}, claim string, val any) {
+	switch v := val.(type) {
+	case string, float64, int, int64:
+		// Ensure the claim set is initialized
+		if sets[claim] == nil {
+			sets[claim] = make(map[string]struct{})
+		}
+		// Add the stringified scalar to the set
+		sets[claim][fmt.Sprintf("%v", v)] = struct{}{}
+
+	case []string:
+		// Ensure the claim set is initialized
+		if sets[claim] == nil {
+			sets[claim] = make(map[string]struct{})
+		}
+		// Add each string value to the set
+		for _, s := range v {
+			sets[claim][s] = struct{}{}
+		}
+
+	case []any:
+		// Recursively handle each item in the slice
+		for _, item := range v {
+			addClaimValue(sets, claim, item)
+		}
+
+	default:
+		// Log unsupported types for visibility and debugging
+		log.Printf("Unsupported claim type for %q: %#v (type %T)", claim, val, val)
+	}
+}
+
+// withExtraClaims merges flattened extra claims from a list of capRule into the provided struct v,
+// returning a map[string]any that combines both sources.
+//
+// v is any struct whose fields represent static claims; it is first marshaled to JSON, then unmarshalled into a generic map.
+// rules is a slice of capRule objects that may define additional (extra) claims to merge.
+//
+// These extra claims are flattened and merged into the base map unless they conflict with protected claims.
+// Claims defined in openIDSupportedClaims are considered protected and cannot be overwritten.
+// If an extra claim attempts to overwrite a protected claim, an error is returned.
+//
+// Returns the merged claims map or an error if any protected claim is violated or JSON (un)marshaling fails.
+func withExtraClaims(v any, rules []capRule) (map[string]any, error) {
+	// Marshal the static struct
+	data, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+
+	// Unmarshal into a generic map
+	var claimMap map[string]any
+	if err := json.Unmarshal(data, &claimMap); err != nil {
+		return nil, err
+	}
+
+	// Convert views.Slice to a map[string]struct{} for efficient lookup
+	protected := make(map[string]struct{}, len(openIDSupportedClaims.AsSlice()))
+	for _, claim := range openIDSupportedClaims.AsSlice() {
+		protected[claim] = struct{}{}
+	}
+
+	// Merge extra claims
+	extra := flattenExtraClaims(rules)
+	for k, v := range extra {
+		if _, isProtected := protected[k]; isProtected {
+			log.Printf("Skip overwriting of existing claim %q", k)
+			return nil, fmt.Errorf("extra claim %q overwriting existing claim", k)
+		}
+
+		claimMap[k] = v
+	}
+
+	return claimMap, nil
 }
 
 func (s *idpServer) serveToken(w http.ResponseWriter, r *http.Request) {
@@ -592,8 +747,22 @@ func (s *idpServer) serveToken(w http.ResponseWriter, r *http.Request) {
 		tsClaims.Issuer = s.loopbackURL
 	}
 
+	rules, err := tailcfg.UnmarshalCapJSON[capRule](who.CapMap, tailcfg.PeerCapabilityTsIDP)
+	if err != nil {
+		log.Printf("tsidp: failed to unmarshal capability: %v", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	tsClaimsWithExtra, err := withExtraClaims(tsClaims, rules)
+	if err != nil {
+		log.Printf("tsidp: failed to merge extra claims: %v", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	// Create an OIDC token using this issuer's signer.
-	token, err := jwt.Signed(signer).Claims(tsClaims).CompactSerialize()
+	token, err := jwt.Signed(signer).Claims(tsClaimsWithExtra).CompactSerialize()
 	if err != nil {
 		log.Printf("Error getting token: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -621,7 +790,7 @@ type oidcTokenResponse struct {
 	IDToken      string `json:"id_token"`
 	TokenType    string `json:"token_type"`
 	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
+	RefreshToken string `json:"refresh_token,omitempty"`
 	ExpiresIn    int    `json:"expires_in"`
 }
 
@@ -762,6 +931,18 @@ var (
 )
 
 func (s *idpServer) serveOpenIDConfig(w http.ResponseWriter, r *http.Request) {
+	h := w.Header()
+	h.Set("Access-Control-Allow-Origin", "*")
+	h.Set("Access-Control-Allow-Method", "GET, OPTIONS")
+	// allow all to prevent errors from client sending their own bespoke headers
+	// and having the server reject the request.
+	h.Set("Access-Control-Allow-Headers", "*")
+
+	// early return for pre-flight OPTIONS requests.
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	if r.URL.Path != oidcConfigPath {
 		http.Error(w, "tsidp: not found", http.StatusNotFound)
 		return

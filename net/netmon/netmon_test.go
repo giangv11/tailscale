@@ -11,11 +11,16 @@ import (
 	"testing"
 	"time"
 
+	"tailscale.com/util/eventbus"
+	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/util/mak"
 )
 
 func TestMonitorStartClose(t *testing.T) {
-	mon, err := New(t.Logf)
+	bus := eventbus.New()
+	defer bus.Close()
+
+	mon, err := New(bus, t.Logf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,7 +31,10 @@ func TestMonitorStartClose(t *testing.T) {
 }
 
 func TestMonitorJustClose(t *testing.T) {
-	mon, err := New(t.Logf)
+	bus := eventbus.New()
+	defer bus.Close()
+
+	mon, err := New(bus, t.Logf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +44,10 @@ func TestMonitorJustClose(t *testing.T) {
 }
 
 func TestMonitorInjectEvent(t *testing.T) {
-	mon, err := New(t.Logf)
+	bus := eventbus.New()
+	defer bus.Close()
+
+	mon, err := New(bus, t.Logf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,6 +69,23 @@ func TestMonitorInjectEvent(t *testing.T) {
 	}
 }
 
+func TestMonitorInjectEventOnBus(t *testing.T) {
+	bus := eventbustest.NewBus(t)
+
+	mon, err := New(bus, t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mon.Close()
+	tw := eventbustest.NewWatcher(t, bus)
+
+	mon.Start()
+	mon.InjectEvent()
+	if err := eventbustest.Expect(tw, eventbustest.Type[*ChangeDelta]()); err != nil {
+		t.Error(err)
+	}
+}
+
 var (
 	monitor         = flag.String("monitor", "", `go into monitor mode like 'route monitor'; test never terminates. Value can be either "raw" or "callback"`)
 	monitorDuration = flag.Duration("monitor-duration", 0, "if non-zero, how long to run TestMonitorMode. Zero means forever.")
@@ -67,11 +95,15 @@ func TestMonitorMode(t *testing.T) {
 	switch *monitor {
 	case "":
 		t.Skip("skipping non-test without --monitor")
-	case "raw", "callback":
+	case "raw", "callback", "eventbus":
 	default:
-		t.Skipf(`invalid --monitor value: must be "raw" or "callback"`)
+		t.Skipf(`invalid --monitor value: must be "raw", "callback" or "eventbus"`)
 	}
-	mon, err := New(t.Logf)
+
+	bus := eventbustest.NewBus(t)
+	tw := eventbustest.NewWatcher(t, bus)
+
+	mon, err := New(bus, t.Logf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,6 +142,16 @@ func TestMonitorMode(t *testing.T) {
 		mon.Start()
 		<-done
 		t.Logf("%v callbacks", n)
+	case "eventbus":
+		tw.TimeOut = *monitorDuration
+		n := 0
+		mon.Start()
+		eventbustest.Expect(tw, func(event *ChangeDelta) (bool, error) {
+			n++
+			t.Logf("cb: changed=%v, ifSt=%v", event.Major, event.New)
+			return false, nil // Return false, indicating we wanna look for more events
+		})
+		t.Logf("%v events", n)
 	}
 }
 

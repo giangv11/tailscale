@@ -10,7 +10,6 @@ import (
 	"reflect"
 	"regexp"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -69,6 +68,8 @@ func TestHostinfoEqual(t *testing.T) {
 		"AppConnector",
 		"ServicesHash",
 		"Location",
+		"TPM",
+		"StateEncrypted",
 	}
 	if have := fieldsOf(reflect.TypeFor[Hostinfo]()); !reflect.DeepEqual(have, hiHandles) {
 		t.Errorf("Hostinfo.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
@@ -277,82 +278,6 @@ func TestHostinfoEqual(t *testing.T) {
 		got := tt.a.Equal(tt.b)
 		if got != tt.want {
 			t.Errorf("%d. Equal = %v; want %v", i, got, tt.want)
-		}
-	}
-}
-
-func TestHostinfoHowEqual(t *testing.T) {
-	tests := []struct {
-		a, b *Hostinfo
-		want []string
-	}{
-		{
-			a:    nil,
-			b:    nil,
-			want: nil,
-		},
-		{
-			a:    new(Hostinfo),
-			b:    nil,
-			want: []string{"nil"},
-		},
-		{
-			a:    nil,
-			b:    new(Hostinfo),
-			want: []string{"nil"},
-		},
-		{
-			a:    new(Hostinfo),
-			b:    new(Hostinfo),
-			want: nil,
-		},
-		{
-			a: &Hostinfo{
-				IPNVersion:  "1",
-				ShieldsUp:   false,
-				RoutableIPs: []netip.Prefix{netip.MustParsePrefix("1.2.3.0/24")},
-			},
-			b: &Hostinfo{
-				IPNVersion:  "2",
-				ShieldsUp:   true,
-				RoutableIPs: []netip.Prefix{netip.MustParsePrefix("1.2.3.0/25")},
-			},
-			want: []string{"IPNVersion", "ShieldsUp", "RoutableIPs"},
-		},
-		{
-			a: &Hostinfo{
-				IPNVersion: "1",
-			},
-			b: &Hostinfo{
-				IPNVersion: "2",
-				NetInfo:    new(NetInfo),
-			},
-			want: []string{"IPNVersion", "NetInfo.nil"},
-		},
-		{
-			a: &Hostinfo{
-				IPNVersion: "1",
-				NetInfo: &NetInfo{
-					WorkingIPv6:   "true",
-					HavePortMap:   true,
-					LinkType:      "foo",
-					PreferredDERP: 123,
-					DERPLatency: map[string]float64{
-						"foo": 1.0,
-					},
-				},
-			},
-			b: &Hostinfo{
-				IPNVersion: "2",
-				NetInfo:    &NetInfo{},
-			},
-			want: []string{"IPNVersion", "NetInfo.WorkingIPv6", "NetInfo.HavePortMap", "NetInfo.PreferredDERP", "NetInfo.LinkType", "NetInfo.DERPLatency"},
-		},
-	}
-	for i, tt := range tests {
-		got := tt.a.HowUnequal(tt.b)
-		if !reflect.DeepEqual(got, tt.want) {
-			t.Errorf("%d. got %q; want %q", i, got, tt.want)
 		}
 	}
 }
@@ -725,28 +650,6 @@ func TestCloneNode(t *testing.T) {
 	}
 }
 
-func TestUserProfileJSONMarshalForMac(t *testing.T) {
-	// Old macOS clients had a bug where they required
-	// UserProfile.Roles to be non-null. Lock that in
-	// 1.0.x/1.2.x clients are gone in the wild.
-	// See mac commit 0242c08a2ca496958027db1208f44251bff8488b (Sep 30).
-	// It was fixed in at least 1.4.x, and perhaps 1.2.x.
-	j, err := json.Marshal(UserProfile{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	const wantSub = `"Roles":[]`
-	if !strings.Contains(string(j), wantSub) {
-		t.Fatalf("didn't contain %#q; got: %s", wantSub, j)
-	}
-
-	// And back:
-	var up UserProfile
-	if err := json.Unmarshal(j, &up); err != nil {
-		t.Fatalf("Unmarshal: %v", err)
-	}
-}
-
 func TestEndpointTypeMarshal(t *testing.T) {
 	eps := []EndpointType{
 		EndpointUnknownType,
@@ -972,6 +875,82 @@ func TestCheckTag(t *testing.T) {
 				t.Errorf("got nil; want error")
 			} else if err != nil && tt.want {
 				t.Errorf("got %v; want nil", err)
+			}
+		})
+	}
+}
+
+func TestDisplayMessageEqual(t *testing.T) {
+	base := DisplayMessage{
+		Title:               "title",
+		Text:                "text",
+		Severity:            SeverityHigh,
+		ImpactsConnectivity: false,
+	}
+
+	type test struct {
+		name      string
+		value     DisplayMessage
+		wantEqual bool
+	}
+
+	for _, test := range []test{
+		{
+			name: "same",
+			value: DisplayMessage{
+				Title:               "title",
+				Text:                "text",
+				Severity:            SeverityHigh,
+				ImpactsConnectivity: false,
+			},
+			wantEqual: true,
+		},
+		{
+			name: "different-title",
+			value: DisplayMessage{
+				Title:               "different title",
+				Text:                "text",
+				Severity:            SeverityHigh,
+				ImpactsConnectivity: false,
+			},
+			wantEqual: false,
+		},
+		{
+			name: "different-text",
+			value: DisplayMessage{
+				Title:               "title",
+				Text:                "different text",
+				Severity:            SeverityHigh,
+				ImpactsConnectivity: false,
+			},
+			wantEqual: false,
+		},
+		{
+			name: "different-severity",
+			value: DisplayMessage{
+				Title:               "title",
+				Text:                "text",
+				Severity:            SeverityMedium,
+				ImpactsConnectivity: false,
+			},
+			wantEqual: false,
+		},
+		{
+			name: "different-impactsConnectivity",
+			value: DisplayMessage{
+				Title:               "title",
+				Text:                "text",
+				Severity:            SeverityHigh,
+				ImpactsConnectivity: true,
+			},
+			wantEqual: false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := base.Equal(test.value)
+
+			if got != test.wantEqual {
+				t.Errorf("Equal: got %t, want %t", got, test.wantEqual)
 			}
 		})
 	}

@@ -24,6 +24,9 @@ spec:
           jsonPath: .spec.type
           name: Type
           type: string
+        - jsonPath: .metadata.creationTimestamp
+          name: Age
+          type: date
       name: v1alpha1
       schema:
         openAPIV3Schema:
@@ -121,7 +124,10 @@ spec:
                 conditions:
                   description: |-
                     List of status conditions to indicate the status of the ProxyGroup
-                    resources. Known condition types are `ProxyGroupReady`.
+                    resources. Known condition types are `ProxyGroupReady`, `ProxyGroupAvailable`.
+                    `ProxyGroupReady` indicates all ProxyGroup resources are fully reconciled
+                    and ready. `ProxyGroupAvailable` indicates that at least one proxy is
+                    ready to serve traffic.
                   type: array
                   items:
                     description: Condition contains details for one aspect of the current state of this API Resource.
@@ -193,6 +199,11 @@ spec:
                           If MagicDNS is enabled in your tailnet, it is the MagicDNS name of the
                           node.
                         type: string
+                      staticEndpoints:
+                        description: StaticEndpoints are user configured, 'static' endpoints by which tailnet peers can reach this device.
+                        type: array
+                        items:
+                          type: string
                       tailnetIPs:
                         description: |-
                           TailnetIPs is the set of tailnet IP addresses (both IPv4 and IPv6)

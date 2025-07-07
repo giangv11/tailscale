@@ -22,7 +22,10 @@ updatedeps: ## Update depaware deps
 		tailscale.com/cmd/tailscale \
 		tailscale.com/cmd/derper \
 		tailscale.com/cmd/k8s-operator \
-		tailscale.com/cmd/stund
+		tailscale.com/cmd/stund \
+		tailscale.com/cmd/tsidp
+	PATH="$$(./tool/go env GOROOT)/bin:$$PATH" ./tool/go run github.com/tailscale/depaware --update -goos=linux,darwin,windows,android,ios --internal \
+		tailscale.com/tsnet
 
 depaware: ## Run depaware checks
 	# depaware (via x/tools/go/packages) shells back to "go", so make sure the "go"
@@ -32,7 +35,10 @@ depaware: ## Run depaware checks
 		tailscale.com/cmd/tailscale \
 		tailscale.com/cmd/derper \
 		tailscale.com/cmd/k8s-operator \
-		tailscale.com/cmd/stund
+		tailscale.com/cmd/stund \
+		tailscale.com/cmd/tsidp
+	PATH="$$(./tool/go env GOROOT)/bin:$$PATH" ./tool/go run github.com/tailscale/depaware --check --goos=linux,darwin,windows,android,ios --internal \
+		tailscale.com/tsnet
 
 buildwindows: ## Build tailscale CLI for windows/amd64
 	GOOS=windows GOARCH=amd64 ./tool/go install tailscale.com/cmd/tailscale tailscale.com/cmd/tailscaled
@@ -58,7 +64,7 @@ buildmultiarchimage: ## Build (and optionally push) multiarch docker image
 check: staticcheck vet depaware buildwindows build386 buildlinuxarm buildwasm ## Perform basic checks and compilation tests
 
 staticcheck: ## Run staticcheck.io checks
-	./tool/go run honnef.co/go/tools/cmd/staticcheck -- $$(./tool/go list ./... | grep -v tempfork)
+	./tool/go run honnef.co/go/tools/cmd/staticcheck -- $$(./tool/go run ./tool/listpkgs --ignore-3p  ./...)
 
 kube-generate-all: kube-generate-deepcopy ## Refresh generated files for Tailscale Kubernetes Operator
 	./tool/go generate ./cmd/k8s-operator
@@ -109,6 +115,14 @@ publishdevnameserver: ## Build and publish k8s-nameserver image to location spec
 	@test "${REPO}" != "tailscale/k8s-nameserver" || (echo "REPO=... must not be tailscale/k8s-nameserver" && exit 1)
 	@test "${REPO}" != "ghcr.io/tailscale/k8s-nameserver" || (echo "REPO=... must not be ghcr.io/tailscale/k8s-nameserver" && exit 1)
 	TAGS="${TAGS}" REPOS=${REPO} PLATFORM=${PLATFORM} PUSH=true TARGET=k8s-nameserver ./build_docker.sh
+
+publishdevtsidp: ## Build and publish tsidp image to location specified by ${REPO}
+	@test -n "${REPO}" || (echo "REPO=... required; e.g. REPO=ghcr.io/${USER}/tailscale" && exit 1)
+	@test "${REPO}" != "tailscale/tailscale" || (echo "REPO=... must not be tailscale/tailscale" && exit 1)
+	@test "${REPO}" != "ghcr.io/tailscale/tailscale" || (echo "REPO=... must not be ghcr.io/tailscale/tailscale" && exit 1)
+	@test "${REPO}" != "tailscale/tsidp" || (echo "REPO=... must not be tailscale/tsidp" && exit 1)
+	@test "${REPO}" != "ghcr.io/tailscale/tsidp" || (echo "REPO=... must not be ghcr.io/tailscale/tsidp" && exit 1)
+	TAGS="${TAGS}" REPOS=${REPO} PLATFORM=${PLATFORM} PUSH=true TARGET=tsidp ./build_docker.sh
 
 .PHONY: sshintegrationtest
 sshintegrationtest: ## Run the SSH integration tests in various Docker containers

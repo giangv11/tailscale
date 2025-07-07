@@ -24,6 +24,7 @@ var ConnectorKind = "Connector"
 // +kubebuilder:printcolumn:name="IsExitNode",type="string",JSONPath=`.status.isExitNode`,description="Whether this Connector instance defines an exit node."
 // +kubebuilder:printcolumn:name="IsAppConnector",type="string",JSONPath=`.status.isAppConnector`,description="Whether this Connector instance is an app connector."
 // +kubebuilder:printcolumn:name="Status",type="string",JSONPath=`.status.conditions[?(@.type == "ConnectorReady")].reason`,description="Status of the deployed Connector resources."
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // Connector defines a Tailscale node that will be deployed in the cluster. The
 // node can be configured to act as a Tailscale subnet router and/or a Tailscale
@@ -204,11 +205,12 @@ type ConnectorStatus struct {
 type ConditionType string
 
 const (
-	ConnectorReady  ConditionType = `ConnectorReady`
-	ProxyClassReady ConditionType = `ProxyClassReady`
-	ProxyGroupReady ConditionType = `ProxyGroupReady`
-	ProxyReady      ConditionType = `TailscaleProxyReady` // a Tailscale-specific condition type for corev1.Service
-	RecorderReady   ConditionType = `RecorderReady`
+	ConnectorReady      ConditionType = `ConnectorReady`
+	ProxyClassReady     ConditionType = `ProxyClassReady`
+	ProxyGroupReady     ConditionType = `ProxyGroupReady`     // All proxy Pods running.
+	ProxyGroupAvailable ConditionType = `ProxyGroupAvailable` // At least one proxy Pod running.
+	ProxyReady          ConditionType = `TailscaleProxyReady` // a Tailscale-specific condition type for corev1.Service
+	RecorderReady       ConditionType = `RecorderReady`
 	// EgressSvcValid gets set on a user configured ExternalName Service that defines a tailnet target to be exposed
 	// on a ProxyGroup.
 	// Set to true if the user provided configuration is valid.
@@ -221,4 +223,7 @@ const (
 	// on a ProxyGroup.
 	// Set to true if the service is ready to route cluster traffic.
 	EgressSvcReady ConditionType = `TailscaleEgressSvcReady`
+
+	IngressSvcValid      ConditionType = `TailscaleIngressSvcValid`
+	IngressSvcConfigured ConditionType = `TailscaleIngressSvcConfigured`
 )

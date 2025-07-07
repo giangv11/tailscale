@@ -44,6 +44,8 @@ import (
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 	"tailscale.com/drive/driveimpl"
 	"tailscale.com/envknob"
+	_ "tailscale.com/ipn/auditlog"
+	_ "tailscale.com/ipn/desktop"
 	"tailscale.com/logpolicy"
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/dns"
@@ -326,8 +328,8 @@ func beWindowsSubprocess() bool {
 		log.Printf("Error pre-loading \"%s\": %v", fqWintunPath, err)
 	}
 
-	sys := new(tsd.System)
-	netMon, err := netmon.New(log.Printf)
+	sys := tsd.NewSystem()
+	netMon, err := netmon.New(sys.Bus.Get(), log.Printf)
 	if err != nil {
 		log.Fatalf("Could not create netMon: %v", err)
 	}

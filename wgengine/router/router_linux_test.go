@@ -27,6 +27,7 @@ import (
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tstest"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/eventbus"
 	"tailscale.com/util/linuxfw"
 	"tailscale.com/version/distro"
 )
@@ -363,7 +364,9 @@ ip route add throw 192.168.0.0/24 table 52` + basic,
 		},
 	}
 
-	mon, err := netmon.New(logger.Discard)
+	bus := eventbus.New()
+	defer bus.Close()
+	mon, err := netmon.New(bus, logger.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -551,6 +554,14 @@ func (n *fakeIPTablesRunner) DeleteSvc(svc, tun string, targetIPs []netip.Addr, 
 }
 
 func (n *fakeIPTablesRunner) ClampMSSToPMTU(tun string, addr netip.Addr) error {
+	return errors.New("not implemented")
+}
+
+func (n *fakeIPTablesRunner) EnsureDNATRuleForSvc(svcName string, origDst, dst netip.Addr) error {
+	return errors.New("not implemented")
+}
+
+func (n *fakeIPTablesRunner) DeleteDNATRuleForSvc(svcName string, origDst, dst netip.Addr) error {
 	return errors.New("not implemented")
 }
 
@@ -973,7 +984,10 @@ func newLinuxRootTest(t *testing.T) *linuxTest {
 
 	logf := lt.logOutput.Logf
 
-	mon, err := netmon.New(logger.Discard)
+	bus := eventbus.New()
+	defer bus.Close()
+
+	mon, err := netmon.New(bus, logger.Discard)
 	if err != nil {
 		lt.Close()
 		t.Fatal(err)

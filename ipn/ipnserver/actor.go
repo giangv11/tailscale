@@ -32,6 +32,7 @@ type actor struct {
 	ci   *ipnauth.ConnIdentity
 
 	clientID ipnauth.ClientID
+	userID   ipn.WindowsUserID // cached Windows user ID of the connected client process.
 	// accessOverrideReason specifies the reason for overriding certain access restrictions,
 	// such as permitting a user to disconnect when the always-on mode is enabled,
 	// provided that such justification is allowed by the policy.
@@ -59,7 +60,14 @@ func newActor(logf logger.Logf, c net.Conn) (*actor, error) {
 		// connectivity on domain-joined devices and/or be slow.
 		clientID = ipnauth.ClientIDFrom(pid)
 	}
-	return &actor{logf: logf, ci: ci, clientID: clientID, isLocalSystem: connIsLocalSystem(ci)}, nil
+	return &actor{
+			logf:          logf,
+			ci:            ci,
+			clientID:      clientID,
+			userID:        ci.WindowsUserID(),
+			isLocalSystem: connIsLocalSystem(ci),
+		},
+		nil
 }
 
 // actorWithAccessOverride returns a new actor that carries the specified
@@ -73,6 +81,7 @@ func actorWithAccessOverride(baseActor *actor, reason string) *actor {
 		logf:                 baseActor.logf,
 		ci:                   baseActor.ci,
 		clientID:             baseActor.clientID,
+		userID:               baseActor.userID,
 		accessOverrideReason: reason,
 		isLocalSystem:        baseActor.isLocalSystem,
 	}
@@ -106,7 +115,7 @@ func (a *actor) IsLocalAdmin(operatorUID string) bool {
 
 // UserID implements [ipnauth.Actor].
 func (a *actor) UserID() ipn.WindowsUserID {
-	return a.ci.WindowsUserID()
+	return a.userID
 }
 
 func (a *actor) pid() int {
@@ -117,6 +126,9 @@ func (a *actor) pid() int {
 func (a *actor) ClientID() (_ ipnauth.ClientID, ok bool) {
 	return a.clientID, a.clientID != ipnauth.NoClientID
 }
+
+// Context implements [ipnauth.Actor].
+func (a *actor) Context() context.Context { return context.Background() }
 
 // Username implements [ipnauth.Actor].
 func (a *actor) Username() (string, error) {
@@ -132,7 +144,7 @@ func (a *actor) Username() (string, error) {
 		}
 		defer tok.Close()
 		return tok.Username()
-	case "darwin", "linux", "illumos", "solaris":
+	case "darwin", "linux", "illumos", "solaris", "openbsd":
 		uid, ok := a.ci.Creds().UserID()
 		if !ok {
 			return "", errors.New("missing user ID")
@@ -165,6 +177,12 @@ var actorKey = ctxkey.New("ipnserver.actor", actorOrError{err: errNoActor})
 func contextWithActor(ctx context.Context, logf logger.Logf, c net.Conn) context.Context {
 	actor, err := newActor(logf, c)
 	return actorKey.WithValue(ctx, actorOrError{actor: actor, err: err})
+}
+
+// NewContextWithActorForTest returns a new context that carries the identity
+// of the specified actor. It is used in tests only.
+func NewContextWithActorForTest(ctx context.Context, actor ipnauth.Actor) context.Context {
+	return actorKey.WithValue(ctx, actorOrError{actor: actor})
 }
 
 // actorFromContext returns an [ipnauth.Actor] associated with ctx,

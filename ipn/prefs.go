@@ -29,6 +29,7 @@ import (
 	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/syspolicy"
+	"tailscale.com/version"
 )
 
 // DefaultControlURL is the URL base of the control plane
@@ -92,6 +93,25 @@ type Prefs struct {
 	// prevent any traffic escaping to the local network.
 	ExitNodeID tailcfg.StableNodeID
 	ExitNodeIP netip.Addr
+
+	// AutoExitNode is an optional expression that specifies whether and how
+	// tailscaled should pick an exit node automatically.
+	//
+	// If specified, tailscaled will use an exit node based on the expression,
+	// and will re-evaluate the selection periodically as network conditions,
+	// available exit nodes, or policy settings change. A blackhole route will
+	// be installed to prevent traffic from escaping to the local network until
+	// an exit node is selected. It takes precedence over ExitNodeID and ExitNodeIP.
+	//
+	// If empty, tailscaled will not automatically select an exit node.
+	//
+	// If the specified expression is invalid or unsupported by the client,
+	// it falls back to the behavior of [AnyExitNode].
+	//
+	// As of 2025-07-02, the only supported value is [AnyExitNode].
+	// It's a string rather than a boolean to allow future extensibility
+	// (e.g., AutoExitNode = "mullvad" or AutoExitNode = "geo:us").
+	AutoExitNode ExitNodeExpression `json:",omitempty"`
 
 	// InternalExitNodePrior is the most recently used ExitNodeID in string form. It is set by
 	// the backend on transition from exit node on to off and used by the
@@ -234,6 +254,11 @@ type Prefs struct {
 
 	// PostureChecking enables the collection of information used for device
 	// posture checks.
+	//
+	// Note: this should be named ReportPosture, but it was shipped as
+	// PostureChecking in some early releases and this JSON field is written to
+	// disk, so we just keep its old name. (akin to CorpDNS which is an internal
+	// pref name that doesn't match the public interface)
 	PostureChecking bool
 
 	// NetfilterKind specifies what netfilter implementation to use.
@@ -244,6 +269,14 @@ type Prefs struct {
 	// DriveShares are the configured DriveShares, stored in increasing order
 	// by name.
 	DriveShares []*drive.Share
+
+	// RelayServerPort is the UDP port number for the relay server to bind to,
+	// on all interfaces. A non-nil zero value signifies a random unused port
+	// should be used. A nil value signifies relay server functionality
+	// should be disabled. This field is currently experimental, and therefore
+	// no guarantees are made about its current naming and functionality when
+	// non-nil/enabled.
+	RelayServerPort *int `json:",omitempty"`
 
 	// AllowSingleHosts was a legacy field that was always true
 	// for the past 4.5 years. It controlled whether Tailscale
@@ -311,6 +344,7 @@ type MaskedPrefs struct {
 	RouteAllSet               bool                `json:",omitempty"`
 	ExitNodeIDSet             bool                `json:",omitempty"`
 	ExitNodeIPSet             bool                `json:",omitempty"`
+	AutoExitNodeSet           bool                `json:",omitempty"`
 	InternalExitNodePriorSet  bool                `json:",omitempty"` // Internal; can't be set by LocalAPI clients
 	ExitNodeAllowLANAccessSet bool                `json:",omitempty"`
 	CorpDNSSet                bool                `json:",omitempty"`
@@ -336,6 +370,7 @@ type MaskedPrefs struct {
 	PostureCheckingSet        bool                `json:",omitempty"`
 	NetfilterKindSet          bool                `json:",omitempty"`
 	DriveSharesSet            bool                `json:",omitempty"`
+	RelayServerPortSet        bool                `json:",omitempty"`
 }
 
 // SetsInternal reports whether mp has any of the Internal*Set field bools set
@@ -518,6 +553,9 @@ func (p *Prefs) pretty(goos string) string {
 	} else if !p.ExitNodeID.IsZero() {
 		fmt.Fprintf(&sb, "exit=%v lan=%t ", p.ExitNodeID, p.ExitNodeAllowLANAccess)
 	}
+	if p.AutoExitNode.IsSet() {
+		fmt.Fprintf(&sb, "auto=%v ", p.AutoExitNode)
+	}
 	if len(p.AdvertiseRoutes) > 0 || goos == "linux" {
 		fmt.Fprintf(&sb, "routes=%v ", p.AdvertiseRoutes)
 	}
@@ -554,6 +592,9 @@ func (p *Prefs) pretty(goos string) string {
 	}
 	sb.WriteString(p.AutoUpdate.Pretty())
 	sb.WriteString(p.AppConnector.Pretty())
+	if p.RelayServerPort != nil {
+		fmt.Fprintf(&sb, "relayServerPort=%d ", *p.RelayServerPort)
+	}
 	if p.Persist != nil {
 		sb.WriteString(p.Persist.Pretty())
 	} else {
@@ -580,7 +621,7 @@ func (p PrefsView) Equals(p2 PrefsView) bool {
 }
 
 func (p *Prefs) Equals(p2 *Prefs) bool {
-	if p == nil && p2 == nil {
+	if p == p2 {
 		return true
 	}
 	if p == nil || p2 == nil {
@@ -591,6 +632,7 @@ func (p *Prefs) Equals(p2 *Prefs) bool {
 		p.RouteAll == p2.RouteAll &&
 		p.ExitNodeID == p2.ExitNodeID &&
 		p.ExitNodeIP == p2.ExitNodeIP &&
+		p.AutoExitNode == p2.AutoExitNode &&
 		p.InternalExitNodePrior == p2.InternalExitNodePrior &&
 		p.ExitNodeAllowLANAccess == p2.ExitNodeAllowLANAccess &&
 		p.CorpDNS == p2.CorpDNS &&
@@ -606,16 +648,17 @@ func (p *Prefs) Equals(p2 *Prefs) bool {
 		p.OperatorUser == p2.OperatorUser &&
 		p.Hostname == p2.Hostname &&
 		p.ForceDaemon == p2.ForceDaemon &&
-		compareIPNets(p.AdvertiseRoutes, p2.AdvertiseRoutes) &&
-		compareStrings(p.AdvertiseTags, p2.AdvertiseTags) &&
-		compareStrings(p.AdvertiseServices, p2.AdvertiseServices) &&
+		slices.Equal(p.AdvertiseRoutes, p2.AdvertiseRoutes) &&
+		slices.Equal(p.AdvertiseTags, p2.AdvertiseTags) &&
+		slices.Equal(p.AdvertiseServices, p2.AdvertiseServices) &&
 		p.Persist.Equals(p2.Persist) &&
 		p.ProfileName == p2.ProfileName &&
 		p.AutoUpdate.Equals(p2.AutoUpdate) &&
 		p.AppConnector == p2.AppConnector &&
 		p.PostureChecking == p2.PostureChecking &&
 		slices.EqualFunc(p.DriveShares, p2.DriveShares, drive.SharesEqual) &&
-		p.NetfilterKind == p2.NetfilterKind
+		p.NetfilterKind == p2.NetfilterKind &&
+		compareIntPtrs(p.RelayServerPort, p2.RelayServerPort)
 }
 
 func (au AutoUpdatePrefs) Pretty() string {
@@ -635,28 +678,14 @@ func (ap AppConnectorPrefs) Pretty() string {
 	return ""
 }
 
-func compareIPNets(a, b []netip.Prefix) bool {
-	if len(a) != len(b) {
+func compareIntPtrs(a, b *int) bool {
+	if (a == nil) != (b == nil) {
 		return false
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
+	if a == nil {
+		return true
 	}
-	return true
-}
-
-func compareStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	return *a == *b
 }
 
 // NewPrefs returns the default preferences to use.
@@ -664,7 +693,7 @@ func NewPrefs() *Prefs {
 	// Provide default values for options which might be missing
 	// from the json data for any reason. The json can still
 	// override them to false.
-	return &Prefs{
+	p := &Prefs{
 		// ControlURL is explicitly not set to signal that
 		// it's not yet configured, which relaxes the CLI "up"
 		// safety net features. It will get set to DefaultControlURL
@@ -672,7 +701,6 @@ func NewPrefs() *Prefs {
 		// later anyway.
 		ControlURL: "",
 
-		RouteAll:            true,
 		CorpDNS:             true,
 		WantRunning:         false,
 		NetfilterMode:       preftype.NetfilterOn,
@@ -682,6 +710,8 @@ func NewPrefs() *Prefs {
 			Apply: opt.Bool("unset"),
 		},
 	}
+	p.RouteAll = p.DefaultRouteAll(runtime.GOOS)
+	return p
 }
 
 // ControlURLOrDefault returns the coordination server's URL base.
@@ -709,6 +739,20 @@ func (p *Prefs) ControlURLOrDefault() string {
 		return controlURL
 	}
 	return DefaultControlURL
+}
+
+// DefaultRouteAll returns the default value of [Prefs.RouteAll] as a function
+// of the platform it's running on.
+func (p *Prefs) DefaultRouteAll(goos string) bool {
+	switch goos {
+	case "windows", "android", "ios":
+		return true
+	case "darwin":
+		// Only true for macAppStore and macsys, false for darwin tailscaled.
+		return version.IsSandboxedMacOS()
+	default:
+		return false
+	}
 }
 
 // AdminPageURL returns the admin web site URL for the current ControlURL.
@@ -784,6 +828,7 @@ func isRemoteIP(st *ipnstate.Status, ip netip.Addr) bool {
 func (p *Prefs) ClearExitNode() {
 	p.ExitNodeID = ""
 	p.ExitNodeIP = netip.Addr{}
+	p.AutoExitNode = ""
 }
 
 // ExitNodeLocalIPError is returned when the requested IP address for an exit
@@ -999,4 +1044,47 @@ type LoginProfile struct {
 	// ControlURL is the URL of the control server that this profile is logged
 	// into.
 	ControlURL string
+}
+
+// Equals reports whether p and p2 are equal.
+func (p LoginProfileView) Equals(p2 LoginProfileView) bool {
+	return p.ж.Equals(p2.ж)
+}
+
+// Equals reports whether p and p2 are equal.
+func (p *LoginProfile) Equals(p2 *LoginProfile) bool {
+	if p == p2 {
+		return true
+	}
+	if p == nil || p2 == nil {
+		return false
+	}
+	return p.ID == p2.ID &&
+		p.Name == p2.Name &&
+		p.NetworkProfile == p2.NetworkProfile &&
+		p.Key == p2.Key &&
+		p.UserProfile.Equal(&p2.UserProfile) &&
+		p.NodeID == p2.NodeID &&
+		p.LocalUserID == p2.LocalUserID &&
+		p.ControlURL == p2.ControlURL
+}
+
+// ExitNodeExpression is a string that specifies how an exit node
+// should be selected. An empty string means that no exit node
+// should be selected.
+//
+// As of 2025-07-02, the only supported value is [AnyExitNode].
+type ExitNodeExpression string
+
+// AnyExitNode indicates that the exit node should be automatically
+// selected from the pool of available exit nodes, excluding any
+// disallowed by policy (e.g., [syspolicy.AllowedSuggestedExitNodes]).
+// The exact implementation is subject to change, but exit nodes
+// offering the best performance will be preferred.
+const AnyExitNode ExitNodeExpression = "any"
+
+// IsSet reports whether the expression is non-empty and can be used
+// to select an exit node.
+func (e ExitNodeExpression) IsSet() bool {
+	return e != ""
 }

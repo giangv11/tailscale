@@ -64,6 +64,7 @@ import (
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/multierr"
 	"tailscale.com/util/osshare"
+	"tailscale.com/util/syspolicy"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 	"tailscale.com/wgengine"
@@ -124,6 +125,7 @@ var args struct {
 	debug          string
 	port           uint16
 	statepath      string
+	encryptState   bool
 	statedir       string
 	socketpath     string
 	birdSocketPath string
@@ -151,10 +153,33 @@ var subCommands = map[string]*func([]string) error{
 	"serve-taildrive":         &serveDriveFunc,
 }
 
-var beCLI func() // non-nil if CLI is linked in
+var beCLI func() // non-nil if CLI is linked in with the "ts_include_cli" build tag
+
+// shouldRunCLI reports whether we should run the Tailscale CLI (cmd/tailscale)
+// instead of the daemon (cmd/tailscaled) in the case when the two are linked
+// together into one binary for space savings reasons.
+func shouldRunCLI() bool {
+	if beCLI == nil {
+		// Not linked in with the "ts_include_cli" build tag.
+		return false
+	}
+	if len(os.Args) > 0 && filepath.Base(os.Args[0]) == "tailscale" {
+		// The binary was named (or hardlinked) as "tailscale".
+		return true
+	}
+	if envknob.Bool("TS_BE_CLI") {
+		// The environment variable was set to force it.
+		return true
+	}
+	return false
+}
 
 func main() {
 	envknob.PanicIfAnyEnvCheckedInInit()
+	if shouldRunCLI() {
+		beCLI()
+		return
+	}
 	envknob.ApplyDiskConfig()
 	applyIntegrationTestEnvKnob()
 
@@ -168,6 +193,7 @@ func main() {
 	flag.StringVar(&args.tunname, "tun", defaultTunName(), `tunnel interface name; use "userspace-networking" (beta) to not use TUN`)
 	flag.Var(flagtype.PortValue(&args.port, defaultPort()), "port", "UDP port to listen on for WireGuard and peer-to-peer traffic; 0 means automatically select")
 	flag.StringVar(&args.statepath, "state", "", "absolute path of state file; use 'kube:<secret-name>' to use Kubernetes secrets or 'arn:aws:ssm:...' to store in AWS SSM; use 'mem:' to not store state and register as an ephemeral node. If empty and --statedir is provided, the default is <statedir>/tailscaled.state. Default: "+paths.DefaultTailscaledStateFile())
+	flag.BoolVar(&args.encryptState, "encrypt-state", defaultEncryptState(), "encrypt the state file on disk; uses TPM on Linux and Windows, on all other platforms this flag is not supported")
 	flag.StringVar(&args.statedir, "statedir", "", "path to directory for storage of config state, TLS certs, temporary incoming Taildrop files, etc. If empty, it's derived from --state when possible.")
 	flag.StringVar(&args.socketpath, "socket", paths.DefaultTailscaledSocket(), "path of the service unix socket")
 	flag.StringVar(&args.birdSocketPath, "bird-socket", "", "path of the bird unix socket")
@@ -175,9 +201,8 @@ func main() {
 	flag.BoolVar(&args.disableLogs, "no-logs-no-support", false, "disable log uploads; this also disables any technical support")
 	flag.StringVar(&args.confFile, "config", "", "path to config file, or 'vm:user-data' to use the VM's user-data (EC2)")
 
-	if len(os.Args) > 0 && filepath.Base(os.Args[0]) == "tailscale" && beCLI != nil {
-		beCLI()
-		return
+	if runtime.GOOS == "plan9" && os.Getenv("_NETSHELL_CHILD_") != "" {
+		os.Args = []string{"tailscaled", "be-child", "plan9-netshell"}
 	}
 
 	if len(os.Args) > 1 {
@@ -230,7 +255,40 @@ func main() {
 	// Only apply a default statepath when neither have been provided, so that a
 	// user may specify only --statedir if they wish.
 	if args.statepath == "" && args.statedir == "" {
-		args.statepath = paths.DefaultTailscaledStateFile()
+		if runtime.GOOS == "plan9" {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				log.Fatalf("failed to get home directory: %v", err)
+			}
+			args.statedir = filepath.Join(home, "tailscale-state")
+			if err := os.MkdirAll(args.statedir, 0700); err != nil {
+				log.Fatalf("failed to create state directory: %v", err)
+			}
+		} else {
+			args.statepath = paths.DefaultTailscaledStateFile()
+		}
+	}
+
+	if args.encryptState {
+		if runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+			log.SetFlags(0)
+			log.Fatalf("--encrypt-state is not supported on %s", runtime.GOOS)
+		}
+		// Check if we have TPM support in this build.
+		if !store.HasKnownProviderPrefix(store.TPMPrefix + "/") {
+			log.SetFlags(0)
+			log.Fatal("--encrypt-state is not supported in this build of tailscaled")
+		}
+		// Check if we have TPM access.
+		if !hostinfo.New().TPM.Present() {
+			log.SetFlags(0)
+			log.Fatal("--encrypt-state is not supported on this device or a TPM is not accessible")
+		}
+		// Check for conflicting prefix in --state, like arn: or kube:.
+		if args.statepath != "" && store.HasKnownProviderPrefix(args.statepath) {
+			log.SetFlags(0)
+			log.Fatal("--encrypt-state can only be used with --state set to a local file path")
+		}
 	}
 
 	if args.disableLogs {
@@ -280,13 +338,17 @@ func trySynologyMigration(p string) error {
 }
 
 func statePathOrDefault() string {
+	var path string
 	if args.statepath != "" {
-		return args.statepath
+		path = args.statepath
 	}
-	if args.statedir != "" {
-		return filepath.Join(args.statedir, "tailscaled.state")
+	if path == "" && args.statedir != "" {
+		path = filepath.Join(args.statedir, "tailscaled.state")
 	}
-	return ""
+	if path != "" && !store.HasKnownProviderPrefix(path) && args.encryptState {
+		path = store.TPMPrefix + path
+	}
+	return path
 }
 
 // serverOptions is the configuration of the Tailscale node agent.
@@ -339,7 +401,9 @@ var debugMux *http.ServeMux
 func run() (err error) {
 	var logf logger.Logf = log.Printf
 
-	sys := new(tsd.System)
+	// Install an event bus as early as possible, so that it's
+	// available universally when setting up everything else.
+	sys := tsd.NewSystem()
 
 	// Parse config, if specified, to fail early if it's invalid.
 	var conf *conffile.Config
@@ -354,9 +418,7 @@ func run() (err error) {
 	var netMon *netmon.Monitor
 	isWinSvc := isWindowsService()
 	if !isWinSvc {
-		netMon, err = netmon.New(func(format string, args ...any) {
-			logf(format, args...)
-		})
+		netMon, err = netmon.New(sys.Bus.Get(), logf)
 		if err != nil {
 			return fmt.Errorf("netmon.New: %w", err)
 		}
@@ -538,7 +600,7 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logID logid.PublicID
 		if ms, ok := sys.MagicSock.GetOK(); ok {
 			debugMux.HandleFunc("/debug/magicsock", ms.ServeHTTPDebug)
 		}
-		go runDebugServer(debugMux, args.debug)
+		go runDebugServer(logf, debugMux, args.debug)
 	}
 
 	ns, err := newNetstack(logf, sys)
@@ -625,7 +687,6 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logID logid.PublicID
 		Socket:        args.socketpath,
 		UseSocketOnly: args.socketpath != paths.DefaultTailscaledSocket(),
 	})
-	configureTaildrop(logf, lb)
 	if err := ns.Start(lb); err != nil {
 		log.Fatalf("failed to start netstack: %v", err)
 	}
@@ -685,6 +746,7 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
 		Dialer:        sys.Dialer.Get(),
 		SetSubsystem:  sys.Set,
 		ControlKnobs:  sys.ControlKnobs(),
+		EventBus:      sys.Bus.Get(),
 		DriveForLocal: driveimpl.NewFileSystemForLocal(logf),
 	}
 
@@ -729,6 +791,12 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
 			}
 			sys.Set(e)
 			return false, err
+		}
+
+		if runtime.GOOS == "plan9" {
+			// TODO(bradfitz): why don't we do this on all platforms?
+			// We should. Doing it just on plan9 for now conservatively.
+			sys.NetMon.Get().SetTailscaleInterfaceName(devName)
 		}
 
 		r, err := router.New(logf, dev, sys.NetMon.Get(), sys.HealthTracker())
@@ -778,12 +846,20 @@ func servePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
 	clientmetric.WritePrometheusExpositionFormat(w)
 }
 
-func runDebugServer(mux *http.ServeMux, addr string) {
+func runDebugServer(logf logger.Logf, mux *http.ServeMux, addr string) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("debug server: %v", err)
+	}
+	if strings.HasSuffix(addr, ":0") {
+		// Log kernel-selected port number so integration tests
+		// can find it portably.
+		logf("DEBUG-ADDR=%v", ln.Addr())
+	}
 	srv := &http.Server{
-		Addr:    addr,
 		Handler: mux,
 	}
-	if err := srv.ListenAndServe(); err != nil {
+	if err := srv.Serve(ln); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -924,4 +1000,16 @@ func applyIntegrationTestEnvKnob() {
 			envknob.Setenv(k, v)
 		}
 	}
+}
+
+func defaultEncryptState() bool {
+	if runtime.GOOS != "windows" && runtime.GOOS != "linux" {
+		// TPM encryption is only configurable on Windows and Linux. Other
+		// platforms either use system APIs and are not configurable
+		// (Android/Apple), or don't support any form of encryption yet
+		// (plan9/FreeBSD/etc).
+		return false
+	}
+	v, _ := syspolicy.GetBoolean(syspolicy.EncryptState, false)
+	return v
 }

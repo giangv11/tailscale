@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dsnet/try"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
 
@@ -154,7 +154,7 @@ func Test_endpoint_maybeProbeUDPLifetimeLocked(t *testing.T) {
 		lower = b
 		higher = a
 	}
-	addr := addrQuality{AddrPort: try.E1[netip.AddrPort](netip.ParseAddrPort("1.1.1.1:1"))}
+	addr := addrQuality{epAddr: epAddr{ap: netip.MustParseAddrPort("1.1.1.1:1")}}
 	newProbeUDPLifetime := func() *probeUDPLifetime {
 		return &probeUDPLifetime{
 			config: *defaultProbeUDPLifetimeConfig,
@@ -320,6 +320,47 @@ func Test_endpoint_maybeProbeUDPLifetimeLocked(t *testing.T) {
 			}
 			if gotMaybe != tt.wantMaybe {
 				t.Errorf("maybeProbeUDPLifetimeLocked() gotMaybe = %v, want %v", gotMaybe, tt.wantMaybe)
+			}
+		})
+	}
+}
+
+func Test_epAddr_isDirectUDP(t *testing.T) {
+	vni := virtualNetworkID{}
+	vni.set(7)
+	tests := []struct {
+		name string
+		ap   netip.AddrPort
+		vni  virtualNetworkID
+		want bool
+	}{
+		{
+			name: "true",
+			ap:   netip.MustParseAddrPort("192.0.2.1:7"),
+			vni:  virtualNetworkID{},
+			want: true,
+		},
+		{
+			name: "false derp magic addr",
+			ap:   netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, 0),
+			vni:  virtualNetworkID{},
+			want: false,
+		},
+		{
+			name: "false vni set",
+			ap:   netip.MustParseAddrPort("192.0.2.1:7"),
+			vni:  vni,
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := epAddr{
+				ap:  tt.ap,
+				vni: tt.vni,
+			}
+			if got := e.isDirect(); got != tt.want {
+				t.Errorf("isDirect() = %v, want %v", got, tt.want)
 			}
 		})
 	}

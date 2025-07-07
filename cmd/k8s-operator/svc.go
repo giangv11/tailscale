@@ -23,6 +23,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/kube/kubetypes"
@@ -41,6 +42,8 @@ const (
 	reasonProxyInvalid = "ProxyInvalid"
 	reasonProxyFailed  = "ProxyFailed"
 	reasonProxyPending = "ProxyPending"
+
+	indexServiceProxyClass = ".metadata.annotations.service-proxy-class"
 )
 
 type ServiceReconciler struct {
@@ -84,10 +87,10 @@ func childResourceLabels(name, ns, typ string) map[string]string {
 	// proxying. Instead, we have to do our own filtering and tracking with
 	// labels.
 	return map[string]string{
-		LabelManaged:         "true",
-		LabelParentName:      name,
-		LabelParentNamespace: ns,
-		LabelParentType:      typ,
+		kubetypes.LabelManaged: "true",
+		LabelParentName:        name,
+		LabelParentNamespace:   ns,
+		LabelParentType:        typ,
 	}
 }
 
@@ -268,6 +271,7 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		Tags:                tags,
 		ChildResourceLabels: crl,
 		ProxyClassName:      proxyClass,
+		LoginServer:         a.ssr.loginServer,
 	}
 	sts.proxyType = proxyTypeEgress
 	if a.shouldExpose(svc) {
@@ -392,6 +396,7 @@ func validateService(svc *corev1.Service) []string {
 			violations = append(violations, fmt.Sprintf("invalid Tailscale hostname %q, use %q annotation to override: %s", svcName, AnnotationHostname, err))
 		}
 	}
+	violations = append(violations, tagViolations(svc)...)
 	return violations
 }
 
@@ -435,16 +440,6 @@ func tailnetTargetAnnotation(svc *corev1.Service) string {
 		return ip
 	}
 	return svc.Annotations[annotationTailnetTargetIPOld]
-}
-
-// proxyClassForObject returns the proxy class for the given object. If the
-// object does not have a proxy class label, it returns the default proxy class
-func proxyClassForObject(o client.Object, proxyDefaultClass string) string {
-	proxyClass, exists := o.GetLabels()[LabelProxyClass]
-	if !exists {
-		proxyClass = proxyDefaultClass
-	}
-	return proxyClass
 }
 
 func proxyClassIsReady(ctx context.Context, name string, cl client.Client) (bool, error) {

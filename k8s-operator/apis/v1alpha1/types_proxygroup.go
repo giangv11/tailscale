@@ -14,6 +14,7 @@ import (
 // +kubebuilder:resource:scope=Cluster,shortName=pg
 // +kubebuilder:printcolumn:name="Status",type="string",JSONPath=`.status.conditions[?(@.type == "ProxyGroupReady")].reason`,description="Status of the deployed ProxyGroup resources."
 // +kubebuilder:printcolumn:name="Type",type="string",JSONPath=`.spec.type`,description="ProxyGroup type."
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // ProxyGroup defines a set of Tailscale devices that will act as proxies.
 // Currently only egress ProxyGroups are supported.
@@ -87,7 +88,11 @@ type ProxyGroupSpec struct {
 
 type ProxyGroupStatus struct {
 	// List of status conditions to indicate the status of the ProxyGroup
-	// resources. Known condition types are `ProxyGroupReady`.
+	// resources. Known condition types are `ProxyGroupReady`, `ProxyGroupAvailable`.
+	// `ProxyGroupReady` indicates all ProxyGroup resources are fully reconciled
+	// and ready. `ProxyGroupAvailable` indicates that at least one proxy is
+	// ready to serve traffic.
+	//
 	// +listType=map
 	// +listMapKey=type
 	// +optional
@@ -110,6 +115,10 @@ type TailnetDevice struct {
 	// assigned to the device.
 	// +optional
 	TailnetIPs []string `json:"tailnetIPs,omitempty"`
+
+	// StaticEndpoints are user configured, 'static' endpoints by which tailnet peers can reach this device.
+	// +optional
+	StaticEndpoints []string `json:"staticEndpoints,omitempty"`
 }
 
 // +kubebuilder:validation:Type=string

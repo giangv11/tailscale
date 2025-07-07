@@ -40,6 +40,7 @@ func TestPrefsEqual(t *testing.T) {
 		"RouteAll",
 		"ExitNodeID",
 		"ExitNodeIP",
+		"AutoExitNode",
 		"InternalExitNodePrior",
 		"ExitNodeAllowLANAccess",
 		"CorpDNS",
@@ -65,6 +66,7 @@ func TestPrefsEqual(t *testing.T) {
 		"PostureChecking",
 		"NetfilterKind",
 		"DriveShares",
+		"RelayServerPort",
 		"AllowSingleHosts",
 		"Persist",
 	}
@@ -73,6 +75,9 @@ func TestPrefsEqual(t *testing.T) {
 			have, prefsHandles)
 	}
 
+	relayServerPort := func(port int) *int {
+		return &port
+	}
 	nets := func(strs ...string) (ns []netip.Prefix) {
 		for _, s := range strs {
 			n, err := netip.ParsePrefix(s)
@@ -143,6 +148,17 @@ func TestPrefsEqual(t *testing.T) {
 		{
 			&Prefs{ExitNodeIP: netip.MustParseAddr("1.2.3.4")},
 			&Prefs{ExitNodeIP: netip.MustParseAddr("1.2.3.4")},
+			true,
+		},
+
+		{
+			&Prefs{AutoExitNode: ""},
+			&Prefs{AutoExitNode: "auto:any"},
+			false,
+		},
+		{
+			&Prefs{AutoExitNode: "auto:any"},
+			&Prefs{AutoExitNode: "auto:any"},
 			true,
 		},
 
@@ -339,6 +355,16 @@ func TestPrefsEqual(t *testing.T) {
 		{
 			&Prefs{AdvertiseServices: []string{"svc:tux", "svc:xenia"}},
 			&Prefs{AdvertiseServices: []string{"svc:tux", "svc:amelie"}},
+			false,
+		},
+		{
+			&Prefs{RelayServerPort: relayServerPort(0)},
+			&Prefs{RelayServerPort: nil},
+			false,
+		},
+		{
+			&Prefs{RelayServerPort: relayServerPort(0)},
+			&Prefs{RelayServerPort: relayServerPort(1)},
 			false,
 		},
 	}
