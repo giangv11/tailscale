@@ -1,12 +1,11 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build go1.22
-
 // Package local contains a Go client for the Tailscale LocalAPI.
 package local
 
 import (
+	"bufio"
 	"bytes"
 	"cmp"
 	"context"
@@ -16,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -42,6 +42,7 @@ import (
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
 	"tailscale.com/types/tkatype"
+	"tailscale.com/util/eventbus"
 	"tailscale.com/util/syspolicy/setting"
 )
 
@@ -397,6 +398,23 @@ func (lc *Client) IncrementCounter(ctx context.Context, name string, delta int) 
 	return err
 }
 
+// IncrementGauge increments the value of a Tailscale daemon's gauge
+// metric by the given delta. If the metric has yet to exist, a new gauge
+// metric is created and initialized to delta. The delta value can be negative.
+func (lc *Client) IncrementGauge(ctx context.Context, name string, delta int) error {
+	type metricUpdate struct {
+		Name  string `json:"name"`
+		Type  string `json:"type"`
+		Value int    `json:"value"` // amount to increment by
+	}
+	_, err := lc.send(ctx, "POST", "/localapi/v0/upload-client-metrics", 200, jsonBody([]metricUpdate{{
+		Name:  name,
+		Type:  "gauge",
+		Value: delta,
+	}}))
+	return err
+}
+
 // TailDaemonLogs returns a stream the Tailscale daemon's logs as they arrive.
 // Close the context to stop the stream.
 func (lc *Client) TailDaemonLogs(ctx context.Context) (io.Reader, error) {
@@ -412,6 +430,44 @@ func (lc *Client) TailDaemonLogs(ctx context.Context) (io.Reader, error) {
 		return nil, errors.New(res.Status)
 	}
 	return res.Body, nil
+}
+
+// StreamBusEvents returns an iterator of Tailscale bus events as they arrive.
+// Each pair is a valid event and a nil error, or a zero event a non-nil error.
+// In case of error, the iterator ends after the pair reporting the error.
+// Iteration stops if ctx ends.
+func (lc *Client) StreamBusEvents(ctx context.Context) iter.Seq2[eventbus.DebugEvent, error] {
+	return func(yield func(eventbus.DebugEvent, error) bool) {
+		req, err := http.NewRequestWithContext(ctx, "GET",
+			"http://"+apitype.LocalAPIHost+"/localapi/v0/debug-bus-events", nil)
+		if err != nil {
+			yield(eventbus.DebugEvent{}, err)
+			return
+		}
+		res, err := lc.doLocalRequestNiceError(req)
+		if err != nil {
+			yield(eventbus.DebugEvent{}, err)
+			return
+		}
+		if res.StatusCode != http.StatusOK {
+			yield(eventbus.DebugEvent{}, errors.New(res.Status))
+			return
+		}
+		defer res.Body.Close()
+		dec := json.NewDecoder(bufio.NewReader(res.Body))
+		for {
+			var evt eventbus.DebugEvent
+			if err := dec.Decode(&evt); err == io.EOF {
+				return
+			} else if err != nil {
+				yield(eventbus.DebugEvent{}, err)
+				return
+			}
+			if !yield(evt, nil) {
+				return
+			}
+		}
+	}
 }
 
 // Pprof returns a pprof profile of the Tailscale daemon.
@@ -781,6 +837,25 @@ func (lc *Client) CheckUDPGROForwarding(ctx context.Context) error {
 	}
 	if err := json.Unmarshal(body, &jres); err != nil {
 		return fmt.Errorf("invalid JSON from check-udp-gro-forwarding: %w", err)
+	}
+	if jres.Warning != "" {
+		return errors.New(jres.Warning)
+	}
+	return nil
+}
+
+// CheckReversePathFiltering asks the local Tailscale daemon whether strict
+// reverse path filtering is enabled, which would break exit node usage on Linux.
+func (lc *Client) CheckReversePathFiltering(ctx context.Context) error {
+	body, err := lc.get200(ctx, "/localapi/v0/check-reverse-path-filtering")
+	if err != nil {
+		return err
+	}
+	var jres struct {
+		Warning string
+	}
+	if err := json.Unmarshal(body, &jres); err != nil {
+		return fmt.Errorf("invalid JSON from check-reverse-path-filtering: %w", err)
 	}
 	if jres.Warning != "" {
 		return errors.New(jres.Warning)

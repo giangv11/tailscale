@@ -7,16 +7,23 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
+	"flag"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"tailscale.com/derp"
 	"tailscale.com/net/netmon"
+	"tailscale.com/net/netx"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
 
@@ -212,6 +219,8 @@ func TestPing(t *testing.T) {
 	}
 }
 
+const testMeshKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
 func newTestServer(t *testing.T, k key.NodePrivate) (serverURL string, s *derp.Server) {
 	s = derp.NewServer(k, t.Logf)
 	httpsrv := &http.Server{
@@ -224,7 +233,7 @@ func newTestServer(t *testing.T, k key.NodePrivate) (serverURL string, s *derp.S
 		t.Fatal(err)
 	}
 	serverURL = "http://" + ln.Addr().String()
-	s.SetMeshKey("1234")
+	s.SetMeshKey(testMeshKey)
 
 	go func() {
 		if err := httpsrv.Serve(ln); err != nil {
@@ -243,7 +252,11 @@ func newWatcherClient(t *testing.T, watcherPrivateKey key.NodePrivate, serverToW
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.MeshKey = "1234"
+	k, err := key.ParseDERPMesh(testMeshKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.MeshKey = k
 	return
 }
 
@@ -292,6 +305,7 @@ func TestBreakWatcherConnRecv(t *testing.T) {
 	defer cancel()
 
 	watcherChan := make(chan int, 1)
+	errChan := make(chan error, 1)
 
 	// Start the watcher thread (which connects to the watched server)
 	wg.Add(1) // To avoid using t.Logf after the test ends. See https://golang.org/issue/40343
@@ -305,8 +319,11 @@ func TestBreakWatcherConnRecv(t *testing.T) {
 			watcherChan <- peers
 		}
 		remove := func(m derp.PeerGoneMessage) { t.Logf("remove: %v", m.Peer.ShortString()); peers-- }
+		notifyErr := func(err error) {
+			errChan <- err
+		}
 
-		watcher1.RunWatchConnectionLoop(ctx, serverPrivateKey1.Public(), t.Logf, add, remove)
+		watcher1.RunWatchConnectionLoop(ctx, serverPrivateKey1.Public(), t.Logf, add, remove, notifyErr)
 	}()
 
 	timer := time.NewTimer(5 * time.Second)
@@ -319,6 +336,10 @@ func TestBreakWatcherConnRecv(t *testing.T) {
 		case peers := <-watcherChan:
 			if peers != 1 {
 				t.Fatal("wrong number of peers added during watcher connection")
+			}
+		case err := <-errChan:
+			if !strings.Contains(err.Error(), "use of closed network connection") {
+				t.Fatalf("expected notifyError connection error to contain 'use of closed network connection', got %v", err)
 			}
 		case <-timer.C:
 			t.Fatalf("watcher did not process the peer update")
@@ -363,6 +384,7 @@ func TestBreakWatcherConn(t *testing.T) {
 
 	watcherChan := make(chan int, 1)
 	breakerChan := make(chan bool, 1)
+	errorChan := make(chan error, 1)
 
 	// Start the watcher thread (which connects to the watched server)
 	wg.Add(1) // To avoid using t.Logf after the test ends. See https://golang.org/issue/40343
@@ -378,8 +400,11 @@ func TestBreakWatcherConn(t *testing.T) {
 			<-breakerChan
 		}
 		remove := func(m derp.PeerGoneMessage) { t.Logf("remove: %v", m.Peer.ShortString()); peers-- }
+		notifyError := func(err error) {
+			errorChan <- err
+		}
 
-		watcher1.RunWatchConnectionLoop(ctx, serverPrivateKey1.Public(), t.Logf, add, remove)
+		watcher1.RunWatchConnectionLoop(ctx, serverPrivateKey1.Public(), t.Logf, add, remove, notifyError)
 	}()
 
 	timer := time.NewTimer(5 * time.Second)
@@ -392,6 +417,10 @@ func TestBreakWatcherConn(t *testing.T) {
 		case peers := <-watcherChan:
 			if peers != 1 {
 				t.Fatal("wrong number of peers added during watcher connection")
+			}
+		case err := <-errorChan:
+			if !strings.Contains(err.Error(), "use of closed network connection") {
+				t.Fatalf("expected notifyError connection error to contain 'use of closed network connection', got %v", err)
 			}
 		case <-timer.C:
 			t.Fatalf("watcher did not process the peer update")
@@ -408,6 +437,7 @@ func TestBreakWatcherConn(t *testing.T) {
 
 func noopAdd(derp.PeerPresentMessage) {}
 func noopRemove(derp.PeerGoneMessage) {}
+func noopNotifyError(error)           {}
 
 func TestRunWatchConnectionLoopServeConnect(t *testing.T) {
 	defer func() { testHookWatchLookConnectResult = nil }()
@@ -435,7 +465,7 @@ func TestRunWatchConnectionLoopServeConnect(t *testing.T) {
 		}
 		return false
 	}
-	watcher.RunWatchConnectionLoop(ctx, pub, t.Logf, noopAdd, noopRemove)
+	watcher.RunWatchConnectionLoop(ctx, pub, t.Logf, noopAdd, noopRemove, noopNotifyError)
 
 	// Test connecting to the server with a zero value for ignoreServerKey,
 	// so we should always connect.
@@ -449,7 +479,7 @@ func TestRunWatchConnectionLoopServeConnect(t *testing.T) {
 		}
 		return false
 	}
-	watcher.RunWatchConnectionLoop(ctx, key.NodePublic{}, t.Logf, noopAdd, noopRemove)
+	watcher.RunWatchConnectionLoop(ctx, key.NodePublic{}, t.Logf, noopAdd, noopRemove, noopNotifyError)
 }
 
 // verify that the LocalAddr method doesn't acquire the mutex.
@@ -483,5 +513,116 @@ func TestProbe(t *testing.T) {
 		if got := rec.Result().StatusCode; got != tt.want {
 			t.Errorf("for path %q got HTTP status %v; want %v", tt.path, got, tt.want)
 		}
+	}
+}
+
+func TestNotifyError(t *testing.T) {
+	defer func() { testHookWatchLookConnectResult = nil }()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+
+	priv := key.NewNode()
+	serverURL, s := newTestServer(t, priv)
+	defer s.Close()
+
+	pub := priv.Public()
+
+	// Test early error notification when c.connect fails.
+	watcher := newWatcherClient(t, priv, serverURL)
+	watcher.SetURLDialer(netx.DialFunc(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		t.Helper()
+		return nil, fmt.Errorf("test error: %s", addr)
+	}))
+	defer watcher.Close()
+
+	testHookWatchLookConnectResult = func(err error, wasSelfConnect bool) bool {
+		t.Helper()
+		if err == nil {
+			t.Fatal("expected error connecting to server, got nil")
+		}
+		if wasSelfConnect {
+			t.Error("wanted normal connect; got self connect")
+		}
+		return false
+	}
+
+	errChan := make(chan error, 1)
+	notifyError := func(err error) {
+		errChan <- err
+	}
+	watcher.RunWatchConnectionLoop(ctx, pub, t.Logf, noopAdd, noopRemove, notifyError)
+
+	select {
+	case err := <-errChan:
+		if !strings.Contains(err.Error(), "test") {
+			t.Errorf("expected test error, got %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("context done before receiving error: %v", ctx.Err())
+	}
+}
+
+var liveNetworkTest = flag.Bool("live-net-tests", false, "run live network tests")
+
+func TestManualDial(t *testing.T) {
+	if !*liveNetworkTest {
+		t.Skip("skipping live network test without --live-net-tests")
+	}
+	dm := &tailcfg.DERPMap{}
+	res, err := http.Get("https://controlplane.tailscale.com/derpmap/default")
+	if err != nil {
+		t.Fatalf("fetching DERPMap: %v", err)
+	}
+	defer res.Body.Close()
+	if err := json.NewDecoder(res.Body).Decode(dm); err != nil {
+		t.Fatalf("decoding DERPMap: %v", err)
+	}
+
+	region := slices.Sorted(maps.Keys(dm.Regions))[0]
+
+	netMon := netmon.NewStatic()
+	rc := NewRegionClient(key.NewNode(), t.Logf, netMon, func() *tailcfg.DERPRegion {
+		return dm.Regions[region]
+	})
+	defer rc.Close()
+
+	if err := rc.Connect(context.Background()); err != nil {
+		t.Fatalf("rc.Connect: %v", err)
+	}
+}
+
+func TestURLDial(t *testing.T) {
+	if !*liveNetworkTest {
+		t.Skip("skipping live network test without --live-net-tests")
+	}
+	dm := &tailcfg.DERPMap{}
+	res, err := http.Get("https://controlplane.tailscale.com/derpmap/default")
+	if err != nil {
+		t.Fatalf("fetching DERPMap: %v", err)
+	}
+	defer res.Body.Close()
+	if err := json.NewDecoder(res.Body).Decode(dm); err != nil {
+		t.Fatalf("decoding DERPMap: %v", err)
+	}
+
+	// find a valid target DERP host to test against
+	var hostname string
+	for _, reg := range dm.Regions {
+		for _, node := range reg.Nodes {
+			if !node.STUNOnly && node.CanPort80 && node.CertName == "" || node.CertName == node.HostName {
+				hostname = node.HostName
+				break
+			}
+		}
+		if hostname != "" {
+			break
+		}
+	}
+	netMon := netmon.NewStatic()
+	c, err := NewClient(key.NewNode(), "https://"+hostname+"/", t.Logf, netMon)
+	defer c.Close()
+
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("rc.Connect: %v", err)
 	}
 }

@@ -68,14 +68,15 @@ var gaugePGIngressResources = clientmetric.NewGauge(kubetypes.MetricIngressPGRes
 type HAIngressReconciler struct {
 	client.Client
 
-	recorder    record.EventRecorder
-	logger      *zap.SugaredLogger
-	tsClient    tsClient
-	tsnetServer tsnetServer
-	tsNamespace string
-	lc          localClient
-	defaultTags []string
-	operatorID  string // stableID of the operator's Tailscale device
+	recorder         record.EventRecorder
+	logger           *zap.SugaredLogger
+	tsClient         tsClient
+	tsnetServer      tsnetServer
+	tsNamespace      string
+	lc               localClient
+	defaultTags      []string
+	operatorID       string // stableID of the operator's Tailscale device
+	ingressClassName string
 
 	mu sync.Mutex // protects following
 	// managedIngresses is a set of all ingress resources that we're currently
@@ -162,7 +163,7 @@ func (r *HAIngressReconciler) maybeProvision(ctx context.Context, hostname strin
 		return false, fmt.Errorf("error getting Tailscale Service %q: %w", hostname, err)
 	}
 
-	if err := validateIngressClass(ctx, r.Client); err != nil {
+	if err := validateIngressClass(ctx, r.Client, r.ingressClassName); err != nil {
 		logger.Infof("error validating tailscale IngressClass: %v.", err)
 		return false, nil
 	}
@@ -182,7 +183,7 @@ func (r *HAIngressReconciler) maybeProvision(ctx context.Context, hostname strin
 		}
 		return false, fmt.Errorf("getting ProxyGroup %q: %w", pgName, err)
 	}
-	if !tsoperator.ProxyGroupIsReady(pg) {
+	if !tsoperator.ProxyGroupAvailable(pg) {
 		logger.Infof("ProxyGroup is not (yet) ready")
 		return false, nil
 	}
@@ -252,7 +253,7 @@ func (r *HAIngressReconciler) maybeProvision(ctx context.Context, hostname strin
 		return false, fmt.Errorf("error determining DNS name base: %w", err)
 	}
 	dnsName := hostname + "." + tcd
-	if err := r.ensureCertResources(ctx, pgName, dnsName, ing); err != nil {
+	if err := r.ensureCertResources(ctx, pg, dnsName, ing); err != nil {
 		return false, fmt.Errorf("error ensuring cert resources: %w", err)
 	}
 
@@ -645,7 +646,7 @@ func (r *HAIngressReconciler) tailnetCertDomain(ctx context.Context) (string, er
 func (r *HAIngressReconciler) shouldExpose(ing *networkingv1.Ingress) bool {
 	isTSIngress := ing != nil &&
 		ing.Spec.IngressClassName != nil &&
-		*ing.Spec.IngressClassName == tailscaleIngressClassName
+		*ing.Spec.IngressClassName == r.ingressClassName
 	pgAnnot := ing.Annotations[AnnotationProxyGroup]
 	return isTSIngress && pgAnnot != ""
 }
@@ -660,18 +661,13 @@ func (r *HAIngressReconciler) validateIngress(ctx context.Context, ing *networki
 	var errs []error
 
 	// Validate tags if present
-	if tstr, ok := ing.Annotations[AnnotationTags]; ok {
-		tags := strings.Split(tstr, ",")
-		for _, tag := range tags {
-			tag = strings.TrimSpace(tag)
-			if err := tailcfg.CheckTag(tag); err != nil {
-				errs = append(errs, fmt.Errorf("tailscale.com/tags annotation contains invalid tag %q: %w", tag, err))
-			}
-		}
+	violations := tagViolations(ing)
+	if len(violations) > 0 {
+		errs = append(errs, fmt.Errorf("Ingress contains invalid tags: %v", strings.Join(violations, ",")))
 	}
 
 	// Validate TLS configuration
-	if ing.Spec.TLS != nil && len(ing.Spec.TLS) > 0 && (len(ing.Spec.TLS) > 1 || len(ing.Spec.TLS[0].Hosts) > 1) {
+	if len(ing.Spec.TLS) > 0 && (len(ing.Spec.TLS) > 1 || len(ing.Spec.TLS[0].Hosts) > 1) {
 		errs = append(errs, fmt.Errorf("Ingress contains invalid TLS block %v: only a single TLS entry with a single host is allowed", ing.Spec.TLS))
 	}
 
@@ -688,7 +684,7 @@ func (r *HAIngressReconciler) validateIngress(ctx context.Context, ing *networki
 	}
 
 	// Validate ProxyGroup readiness
-	if !tsoperator.ProxyGroupIsReady(pg) {
+	if !tsoperator.ProxyGroupAvailable(pg) {
 		errs = append(errs, fmt.Errorf("ProxyGroup %q is not ready", pg.Name))
 	}
 
@@ -699,8 +695,8 @@ func (r *HAIngressReconciler) validateIngress(ctx context.Context, ing *networki
 		return errors.Join(errs...)
 	}
 	for _, i := range ingList.Items {
-		if r.shouldExpose(&i) && hostnameForIngress(&i) == hostname && i.Name != ing.Name {
-			errs = append(errs, fmt.Errorf("found duplicate Ingress %q for hostname %q - multiple Ingresses for the same hostname in the same cluster are not allowed", i.Name, hostname))
+		if r.shouldExpose(&i) && hostnameForIngress(&i) == hostname && i.UID != ing.UID {
+			errs = append(errs, fmt.Errorf("found duplicate Ingress %q for hostname %q - multiple Ingresses for the same hostname in the same cluster are not allowed", client.ObjectKeyFromObject(&i), hostname))
 		}
 	}
 	return errors.Join(errs...)
@@ -936,18 +932,31 @@ func ownersAreSetAndEqual(a, b *tailscale.VIPService) bool {
 // (domain) is a valid Kubernetes resource name.
 // https://github.com/tailscale/tailscale/blob/8b1e7f646ee4730ad06c9b70c13e7861b964949b/util/dnsname/dnsname.go#L99
 // https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#dns-subdomain-names
-func (r *HAIngressReconciler) ensureCertResources(ctx context.Context, pgName, domain string, ing *networkingv1.Ingress) error {
-	secret := certSecret(pgName, r.tsNamespace, domain, ing)
-	if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, secret, nil); err != nil {
+func (r *HAIngressReconciler) ensureCertResources(ctx context.Context, pg *tsapi.ProxyGroup, domain string, ing *networkingv1.Ingress) error {
+	secret := certSecret(pg.Name, r.tsNamespace, domain, ing)
+	if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, secret, func(s *corev1.Secret) {
+		// Labels might have changed if the Ingress has been updated to use a
+		// different ProxyGroup.
+		s.Labels = secret.Labels
+	}); err != nil {
 		return fmt.Errorf("failed to create or update Secret %s: %w", secret.Name, err)
 	}
-	role := certSecretRole(pgName, r.tsNamespace, domain)
-	if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, role, nil); err != nil {
+	role := certSecretRole(pg.Name, r.tsNamespace, domain)
+	if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, role, func(r *rbacv1.Role) {
+		// Labels might have changed if the Ingress has been updated to use a
+		// different ProxyGroup.
+		r.Labels = role.Labels
+	}); err != nil {
 		return fmt.Errorf("failed to create or update Role %s: %w", role.Name, err)
 	}
-	rb := certSecretRoleBinding(pgName, r.tsNamespace, domain)
-	if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, rb, nil); err != nil {
-		return fmt.Errorf("failed to create or update RoleBinding %s: %w", rb.Name, err)
+	rolebinding := certSecretRoleBinding(pg.Name, r.tsNamespace, domain)
+	if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, rolebinding, func(rb *rbacv1.RoleBinding) {
+		// Labels and subjects might have changed if the Ingress has been updated to use a
+		// different ProxyGroup.
+		rb.Labels = rolebinding.Labels
+		rb.Subjects = rolebinding.Subjects
+	}); err != nil {
+		return fmt.Errorf("failed to create or update RoleBinding %s: %w", rolebinding.Name, err)
 	}
 	return nil
 }
@@ -1112,4 +1121,23 @@ func isErrorTailscaleServiceNotFound(err error) bool {
 	var errResp tailscale.ErrResponse
 	ok := errors.As(err, &errResp)
 	return ok && errResp.Status == http.StatusNotFound
+}
+
+func tagViolations(obj client.Object) []string {
+	var violations []string
+	if obj == nil {
+		return nil
+	}
+	tags, ok := obj.GetAnnotations()[AnnotationTags]
+	if !ok {
+		return nil
+	}
+
+	for _, tag := range strings.Split(tags, ",") {
+		tag = strings.TrimSpace(tag)
+		if err := tailcfg.CheckTag(tag); err != nil {
+			violations = append(violations, fmt.Sprintf("invalid tag %q: %v", tag, err))
+		}
+	}
+	return violations
 }

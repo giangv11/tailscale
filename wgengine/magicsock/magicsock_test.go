@@ -19,6 +19,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -50,6 +51,7 @@ import (
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/ping"
+	"tailscale.com/net/stun"
 	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
@@ -70,6 +72,7 @@ import (
 	"tailscale.com/util/slicesx"
 	"tailscale.com/util/usermetric"
 	"tailscale.com/wgengine/filter"
+	"tailscale.com/wgengine/filter/filtertype"
 	"tailscale.com/wgengine/wgcfg"
 	"tailscale.com/wgengine/wgcfg/nmcfg"
 	"tailscale.com/wgengine/wglog"
@@ -165,7 +168,7 @@ type magicStack struct {
 }
 
 // newMagicStack builds and initializes an idle magicsock and
-// friends. You need to call conn.SetNetworkMap and dev.Reconfig
+// friends. You need to call conn.onNodeViewsUpdate and dev.Reconfig
 // before anything interesting happens.
 func newMagicStack(t testing.TB, logf logger.Logf, l nettype.PacketListener, derpMap *tailcfg.DERPMap) *magicStack {
 	privateKey := key.NewNode()
@@ -274,7 +277,10 @@ func (s *magicStack) Status() *ipnstate.Status {
 func (s *magicStack) IP() netip.Addr {
 	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
 		s.conn.mu.Lock()
-		addr := s.conn.firstAddrForTest
+		var addr netip.Addr
+		if s.conn.self.Valid() && s.conn.self.Addresses().Len() > 0 {
+			addr = s.conn.self.Addresses().At(0).Addr()
+		}
 		s.conn.mu.Unlock()
 		if addr.IsValid() {
 			return addr
@@ -338,9 +344,13 @@ func meshStacks(logf logger.Logf, mutateNetmap func(idx int, nm *netmap.NetworkM
 
 		for i, m := range ms {
 			nm := buildNetmapLocked(i)
-			m.conn.SetNetworkMap(nm)
-			peerSet := make(set.Set[key.NodePublic], len(nm.Peers))
-			for _, peer := range nm.Peers {
+			nv := NodeViewsUpdate{
+				SelfNode: nm.SelfNode,
+				Peers:    nm.Peers,
+			}
+			m.conn.onNodeViewsUpdate(nv)
+			peerSet := make(set.Set[key.NodePublic], len(nv.Peers))
+			for _, peer := range nv.Peers {
 				peerSet.Add(peer.Key())
 			}
 			m.conn.UpdatePeers(peerSet)
@@ -1290,41 +1300,6 @@ func assertConnStatsAndUserMetricsEqual(t *testing.T, ms *magicStack) {
 	c.Assert(metricRecvDataPacketsDERP.Value(), qt.Equals, metricDERPRxPackets*2)
 }
 
-func TestDiscoMessage(t *testing.T) {
-	c := newConn(t.Logf)
-	c.privateKey = key.NewNode()
-
-	peer1Pub := c.DiscoPublicKey()
-	peer1Priv := c.discoPrivate
-	n := &tailcfg.Node{
-		Key:      key.NewNode().Public(),
-		DiscoKey: peer1Pub,
-	}
-	ep := &endpoint{
-		nodeID:    1,
-		publicKey: n.Key,
-	}
-	ep.disco.Store(&endpointDisco{
-		key:   n.DiscoKey,
-		short: n.DiscoKey.ShortString(),
-	})
-	c.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
-
-	const payload = "why hello"
-
-	var nonce [24]byte
-	crand.Read(nonce[:])
-
-	pkt := peer1Pub.AppendTo([]byte("TS💬"))
-
-	box := peer1Priv.Shared(c.discoPrivate.Public()).Seal([]byte(payload))
-	pkt = append(pkt, box...)
-	got := c.handleDiscoMessage(pkt, netip.AddrPort{}, key.NodePublic{}, discoRXPathUDP)
-	if !got {
-		t.Error("failed to open it")
-	}
-}
-
 // tests that having a endpoint.String prevents wireguard-go's
 // log.Printf("%v") of its conn.Endpoint values from using reflect to
 // walk into read mutex while they're being used and then causing data
@@ -1358,11 +1333,11 @@ func Test32bitAlignment(t *testing.T) {
 		t.Fatalf("endpoint.lastRecvWG is not 8-byte aligned")
 	}
 
-	de.noteRecvActivity(netip.AddrPort{}, mono.Now()) // verify this doesn't panic on 32-bit
+	de.noteRecvActivity(epAddr{}, mono.Now()) // verify this doesn't panic on 32-bit
 	if called != 1 {
 		t.Fatal("expected call to noteRecvActivity")
 	}
-	de.noteRecvActivity(netip.AddrPort{}, mono.Now())
+	de.noteRecvActivity(epAddr{}, mono.Now())
 	if called != 1 {
 		t.Error("expected no second call to noteRecvActivity")
 	}
@@ -1400,7 +1375,7 @@ func newTestConn(t testing.TB) *Conn {
 	return conn
 }
 
-// addTestEndpoint sets conn's network map to a single peer expected
+// addTestEndpoint sets conn's node views to a single peer expected
 // to receive packets from sendConn (or DERP), and returns that peer's
 // nodekey and discokey.
 func addTestEndpoint(tb testing.TB, conn *Conn, sendConn net.PacketConn) (key.NodePublic, key.DiscoPublic) {
@@ -1409,7 +1384,7 @@ func addTestEndpoint(tb testing.TB, conn *Conn, sendConn net.PacketConn) (key.No
 	// codepath.
 	discoKey := key.DiscoPublicFromRaw32(mem.B([]byte{31: 1}))
 	nodeKey := key.NodePublicFromRaw32(mem.B([]byte{0: 'N', 1: 'K', 31: 0}))
-	conn.SetNetworkMap(&netmap.NetworkMap{
+	conn.onNodeViewsUpdate(NodeViewsUpdate{
 		Peers: nodeViews([]*tailcfg.Node{
 			{
 				ID:        1,
@@ -1598,11 +1573,11 @@ func nodeViews(v []*tailcfg.Node) []tailcfg.NodeView {
 	return nv
 }
 
-// Test that a netmap update where node changes its node key but
+// Test that a node views update where node changes its node key but
 // doesn't change its disco key doesn't result in a broken state.
 //
 // https://github.com/tailscale/tailscale/issues/1391
-func TestSetNetworkMapChangingNodeKey(t *testing.T) {
+func TestOnNodeViewsUpdateChangingNodeKey(t *testing.T) {
 	conn := newTestConn(t)
 	t.Cleanup(func() { conn.Close() })
 	var buf tstest.MemLogger
@@ -1614,7 +1589,7 @@ func TestSetNetworkMapChangingNodeKey(t *testing.T) {
 	nodeKey1 := key.NodePublicFromRaw32(mem.B([]byte{0: 'N', 1: 'K', 2: '1', 31: 0}))
 	nodeKey2 := key.NodePublicFromRaw32(mem.B([]byte{0: 'N', 1: 'K', 2: '2', 31: 0}))
 
-	conn.SetNetworkMap(&netmap.NetworkMap{
+	conn.onNodeViewsUpdate(NodeViewsUpdate{
 		Peers: nodeViews([]*tailcfg.Node{
 			{
 				ID:        1,
@@ -1630,7 +1605,7 @@ func TestSetNetworkMapChangingNodeKey(t *testing.T) {
 	}
 
 	for range 3 {
-		conn.SetNetworkMap(&netmap.NetworkMap{
+		conn.onNodeViewsUpdate(NodeViewsUpdate{
 			Peers: nodeViews([]*tailcfg.Node{
 				{
 					ID:        2,
@@ -1799,10 +1774,15 @@ func TestEndpointSetsEqual(t *testing.T) {
 func TestBetterAddr(t *testing.T) {
 	const ms = time.Millisecond
 	al := func(ipps string, d time.Duration) addrQuality {
-		return addrQuality{AddrPort: netip.MustParseAddrPort(ipps), latency: d}
+		return addrQuality{epAddr: epAddr{ap: netip.MustParseAddrPort(ipps)}, latency: d}
 	}
 	almtu := func(ipps string, d time.Duration, mtu tstun.WireMTU) addrQuality {
-		return addrQuality{AddrPort: netip.MustParseAddrPort(ipps), latency: d, wireMTU: mtu}
+		return addrQuality{epAddr: epAddr{ap: netip.MustParseAddrPort(ipps)}, latency: d, wireMTU: mtu}
+	}
+	avl := func(ipps string, vni uint32, d time.Duration) addrQuality {
+		q := al(ipps, d)
+		q.vni.set(vni)
+		return q
 	}
 	zero := addrQuality{}
 
@@ -1908,6 +1888,18 @@ func TestBetterAddr(t *testing.T) {
 			b:    al("[::1]:555", 100*ms),
 			want: false,
 		},
+
+		// Prefer non-Geneve over Geneve-encapsulated
+		{
+			a:    al(publicV4, 100*ms),
+			b:    avl(publicV4, 1, 100*ms),
+			want: true,
+		},
+		{
+			a:    avl(publicV4, 1, 100*ms),
+			b:    al(publicV4, 100*ms),
+			want: false,
+		},
 	}
 	for i, tt := range tests {
 		got := betterAddr(tt.a, tt.b)
@@ -1938,7 +1930,7 @@ func eps(s ...string) []netip.AddrPort {
 	return eps
 }
 
-func TestStressSetNetworkMap(t *testing.T) {
+func TestStressOnNodeViewsUpdate(t *testing.T) {
 	t.Parallel()
 
 	conn := newTestConn(t)
@@ -1986,15 +1978,15 @@ func TestStressSetNetworkMap(t *testing.T) {
 				allPeers[j].Key = randNodeKey()
 			}
 		}
-		// Clone existing peers into a new netmap.
+		// Clone existing peers.
 		peers := make([]*tailcfg.Node, 0, len(allPeers))
 		for peerIdx, p := range allPeers {
 			if present[peerIdx] {
 				peers = append(peers, p.Clone())
 			}
 		}
-		// Set the netmap.
-		conn.SetNetworkMap(&netmap.NetworkMap{
+		// Set the node views.
+		conn.onNodeViewsUpdate(NodeViewsUpdate{
 			Peers: nodeViews(peers),
 		})
 		// Check invariants.
@@ -2019,9 +2011,9 @@ func (m *peerMap) validate() error {
 			return fmt.Errorf("duplicate endpoint present: %v", pi.ep.publicKey)
 		}
 		seenEps[pi.ep] = true
-		for ipp := range pi.ipPorts {
-			if got := m.byIPPort[ipp]; got != pi {
-				return fmt.Errorf("m.byIPPort[%v] = %v, want %v", ipp, got, pi)
+		for addr := range pi.epAddrs {
+			if got := m.byEpAddr[addr]; got != pi {
+				return fmt.Errorf("m.byEpAddr[%v] = %v, want %v", addr, got, pi)
 			}
 		}
 	}
@@ -2037,13 +2029,13 @@ func (m *peerMap) validate() error {
 		}
 	}
 
-	for ipp, pi := range m.byIPPort {
-		if !pi.ipPorts.Contains(ipp) {
-			return fmt.Errorf("ipPorts[%v] for %v is false", ipp, pi.ep.publicKey)
+	for addr, pi := range m.byEpAddr {
+		if !pi.epAddrs.Contains(addr) {
+			return fmt.Errorf("epAddrs[%v] for %v is false", addr, pi.ep.publicKey)
 		}
 		pi2 := m.byNodeKey[pi.ep.publicKey]
 		if pi != pi2 {
-			return fmt.Errorf("byNodeKey[%v]=%p doesn't match byIPPort[%v]=%p", pi, pi, pi.ep.publicKey, pi2)
+			return fmt.Errorf("byNodeKey[%v]=%p doesn't match byEpAddr[%v]=%p", pi, pi, pi.ep.publicKey, pi2)
 		}
 	}
 
@@ -2119,10 +2111,10 @@ func TestRebindingUDPConn(t *testing.T) {
 }
 
 // https://github.com/tailscale/tailscale/issues/6680: don't ignore
-// SetNetworkMap calls when there are no peers. (A too aggressive fast path was
+// onNodeViewsUpdate calls when there are no peers. (A too aggressive fast path was
 // previously bailing out early, thinking there were no changes since all zero
-// peers didn't change, but the netmap has non-peer info in it too we shouldn't discard)
-func TestSetNetworkMapWithNoPeers(t *testing.T) {
+// peers didn't change, but the node views has non-peer info in it too we shouldn't discard)
+func TestOnNodeViewsUpdateWithNoPeers(t *testing.T) {
 	var c Conn
 	knobs := &controlknobs.Knobs{}
 	c.logf = logger.Discard
@@ -2131,9 +2123,9 @@ func TestSetNetworkMapWithNoPeers(t *testing.T) {
 	for i := 1; i <= 3; i++ {
 		v := !debugEnableSilentDisco()
 		envknob.Setenv("TS_DEBUG_ENABLE_SILENT_DISCO", fmt.Sprint(v))
-		nm := &netmap.NetworkMap{}
-		c.SetNetworkMap(nm)
-		t.Logf("ptr %d: %p", i, nm)
+		nv := NodeViewsUpdate{}
+		c.onNodeViewsUpdate(nv)
+		t.Logf("ptr %d: %p", i, nv)
 		if c.lastFlags.heartbeatDisabled != v {
 			t.Fatalf("call %d: didn't store netmap", i)
 		}
@@ -2230,7 +2222,11 @@ func TestIsWireGuardOnlyPeer(t *testing.T) {
 			},
 		}),
 	}
-	m.conn.SetNetworkMap(nm)
+	nv := NodeViewsUpdate{
+		SelfNode: nm.SelfNode,
+		Peers:    nm.Peers,
+	}
+	m.conn.onNodeViewsUpdate(nv)
 
 	cfg, err := nmcfg.WGCfg(nm, t.Logf, netmap.AllowSubnetRoutes, "")
 	if err != nil {
@@ -2292,7 +2288,11 @@ func TestIsWireGuardOnlyPeerWithMasquerade(t *testing.T) {
 			},
 		}),
 	}
-	m.conn.SetNetworkMap(nm)
+	nv := NodeViewsUpdate{
+		SelfNode: nm.SelfNode,
+		Peers:    nm.Peers,
+	}
+	m.conn.onNodeViewsUpdate(nv)
 
 	cfg, err := nmcfg.WGCfg(nm, t.Logf, netmap.AllowSubnetRoutes, "")
 	if err != nil {
@@ -2329,7 +2329,11 @@ func TestIsWireGuardOnlyPeerWithMasquerade(t *testing.T) {
 // configures WG.
 func applyNetworkMap(t *testing.T, m *magicStack, nm *netmap.NetworkMap) {
 	t.Helper()
-	m.conn.SetNetworkMap(nm)
+	nv := NodeViewsUpdate{
+		SelfNode: nm.SelfNode,
+		Peers:    nm.Peers,
+	}
+	m.conn.onNodeViewsUpdate(nv)
 	// Make sure we can't use v6 to avoid test failures.
 	m.conn.noV6.Store(true)
 
@@ -2444,7 +2448,7 @@ func TestIsWireGuardOnlyPickEndpointByPing(t *testing.T) {
 	// Check that we got a valid address set on the first send - this
 	// will be randomly selected, but because we have noV6 set to true,
 	// it will be the IPv4 address.
-	if !pi.ep.bestAddr.Addr().IsValid() {
+	if !pi.ep.bestAddr.ap.Addr().IsValid() {
 		t.Fatal("bestaddr was nil")
 	}
 
@@ -2504,12 +2508,12 @@ func TestIsWireGuardOnlyPickEndpointByPing(t *testing.T) {
 		t.Fatal("wgkey doesn't exist in peer map")
 	}
 
-	if !pi.ep.bestAddr.Addr().IsValid() {
+	if !pi.ep.bestAddr.ap.Addr().IsValid() {
 		t.Error("no bestAddr address was set")
 	}
 
-	if pi.ep.bestAddr.Addr() != wgEp.Addr() {
-		t.Errorf("bestAddr was not set to the expected IPv4 address: got %v, want %v", pi.ep.bestAddr.Addr().String(), wgEp.Addr())
+	if pi.ep.bestAddr.ap.Addr() != wgEp.Addr() {
+		t.Errorf("bestAddr was not set to the expected IPv4 address: got %v, want %v", pi.ep.bestAddr.ap.Addr().String(), wgEp.Addr())
 	}
 
 	if pi.ep.trustBestAddrUntil.IsZero() {
@@ -2670,7 +2674,7 @@ func TestAddrForSendLockedForWireGuardOnly(t *testing.T) {
 		sendFollowUpPing bool
 		pingTime         mono.Time
 		ep               []endpointDetails
-		want             netip.AddrPort
+		want             epAddr
 	}{
 		{
 			name:             "no endpoints",
@@ -2679,7 +2683,7 @@ func TestAddrForSendLockedForWireGuardOnly(t *testing.T) {
 			sendFollowUpPing: false,
 			pingTime:         testTime,
 			ep:               []endpointDetails{},
-			want:             netip.AddrPort{},
+			want:             epAddr{},
 		},
 		{
 			name:             "singular endpoint does not request ping",
@@ -2693,7 +2697,7 @@ func TestAddrForSendLockedForWireGuardOnly(t *testing.T) {
 					latency:  100 * time.Millisecond,
 				},
 			},
-			want: netip.MustParseAddrPort("1.1.1.1:111"),
+			want: epAddr{ap: netip.MustParseAddrPort("1.1.1.1:111")},
 		},
 		{
 			name:             "ping sent within wireguardPingInterval should not request ping",
@@ -2711,7 +2715,7 @@ func TestAddrForSendLockedForWireGuardOnly(t *testing.T) {
 					latency:  2000 * time.Millisecond,
 				},
 			},
-			want: netip.MustParseAddrPort("1.1.1.1:111"),
+			want: epAddr{ap: netip.MustParseAddrPort("1.1.1.1:111")},
 		},
 		{
 			name:             "ping sent outside of wireguardPingInterval should request ping",
@@ -2729,7 +2733,7 @@ func TestAddrForSendLockedForWireGuardOnly(t *testing.T) {
 					latency:  150 * time.Millisecond,
 				},
 			},
-			want: netip.MustParseAddrPort("1.1.1.1:111"),
+			want: epAddr{ap: netip.MustParseAddrPort("1.1.1.1:111")},
 		},
 		{
 			name:             "choose lowest latency for useable IPv4 and IPv6",
@@ -2747,7 +2751,7 @@ func TestAddrForSendLockedForWireGuardOnly(t *testing.T) {
 					latency:  10 * time.Millisecond,
 				},
 			},
-			want: netip.MustParseAddrPort("[2345:0425:2CA1:0000:0000:0567:5673:23b5]:222"),
+			want: epAddr{ap: netip.MustParseAddrPort("[2345:0425:2CA1:0000:0000:0567:5673:23b5]:222")},
 		},
 		{
 			name:             "choose IPv6 address when latency is the same for v4 and v6",
@@ -2765,7 +2769,7 @@ func TestAddrForSendLockedForWireGuardOnly(t *testing.T) {
 					latency:  100 * time.Millisecond,
 				},
 			},
-			want: netip.MustParseAddrPort("[1::1]:567"),
+			want: epAddr{ap: netip.MustParseAddrPort("[1::1]:567")},
 		},
 	}
 
@@ -2785,8 +2789,8 @@ func TestAddrForSendLockedForWireGuardOnly(t *testing.T) {
 				endpoint.endpointState[epd.addrPort] = &endpointState{}
 			}
 			udpAddr, _, shouldPing := endpoint.addrForSendLocked(testTime)
-			if udpAddr.IsValid() != test.validAddr {
-				t.Errorf("udpAddr validity is incorrect; got %v, want %v", udpAddr.IsValid(), test.validAddr)
+			if udpAddr.ap.IsValid() != test.validAddr {
+				t.Errorf("udpAddr validity is incorrect; got %v, want %v", udpAddr.ap.IsValid(), test.validAddr)
 			}
 			if shouldPing != test.sendInitialPing {
 				t.Errorf("addrForSendLocked did not indiciate correct ping state; got %v, want %v", shouldPing, test.sendInitialPing)
@@ -2818,8 +2822,8 @@ func TestAddrForSendLockedForWireGuardOnly(t *testing.T) {
 			if shouldPing != test.sendFollowUpPing {
 				t.Errorf("addrForSendLocked did not indiciate correct ping state; got %v, want %v", shouldPing, test.sendFollowUpPing)
 			}
-			if endpoint.bestAddr.AddrPort != test.want {
-				t.Errorf("bestAddr.AddrPort is not as expected: got %v, want %v", endpoint.bestAddr.AddrPort, test.want)
+			if endpoint.bestAddr.epAddr != test.want {
+				t.Errorf("bestAddr.epAddr is not as expected: got %v, want %v", endpoint.bestAddr.epAddr, test.want)
 			}
 		})
 	}
@@ -2906,7 +2910,7 @@ func TestAddrForPingSizeLocked(t *testing.T) {
 		t.Run(test.desc, func(t *testing.T) {
 			bestAddr := addrQuality{wireMTU: test.mtu}
 			if test.bestAddr {
-				bestAddr.AddrPort = validUdpAddr
+				bestAddr.epAddr.ap = validUdpAddr
 			}
 			ep := &endpoint{
 				derpAddr: validDerpAddr,
@@ -2918,10 +2922,10 @@ func TestAddrForPingSizeLocked(t *testing.T) {
 
 			udpAddr, derpAddr := ep.addrForPingSizeLocked(testTime, test.size)
 
-			if test.wantUDP && !udpAddr.IsValid() {
+			if test.wantUDP && !udpAddr.ap.IsValid() {
 				t.Errorf("%s: udpAddr returned is not valid, won't be sent to UDP address", test.desc)
 			}
-			if !test.wantUDP && udpAddr.IsValid() {
+			if !test.wantUDP && udpAddr.ap.IsValid() {
 				t.Errorf("%s: udpAddr returned is valid, discovery will not start", test.desc)
 			}
 			if test.wantDERP && !derpAddr.IsValid() {
@@ -3147,7 +3151,7 @@ func TestNetworkDownSendErrors(t *testing.T) {
 	defer conn.Close()
 
 	conn.SetNetworkUp(false)
-	if err := conn.Send([][]byte{{00}}, &lazyEndpoint{}); err == nil {
+	if err := conn.Send([][]byte{{00}}, &lazyEndpoint{}, 0); err == nil {
 		t.Error("expected error, got nil")
 	}
 	resp := httptest.NewRecorder()
@@ -3157,7 +3161,7 @@ func TestNetworkDownSendErrors(t *testing.T) {
 	}
 }
 
-func Test_isDiscoMaybeGeneve(t *testing.T) {
+func Test_packetLooksLike(t *testing.T) {
 	discoPub := key.DiscoPublicFromRaw32(mem.B([]byte{1: 1, 30: 30, 31: 31}))
 	nakedDisco := make([]byte, 0, 512)
 	nakedDisco = append(nakedDisco, disco.Magic...)
@@ -3240,80 +3244,92 @@ func Test_isDiscoMaybeGeneve(t *testing.T) {
 	copy(geneveEncapDiscoNonZeroGeneveVNILSB[packet.GeneveFixedHeaderLength:], nakedDisco)
 
 	tests := []struct {
-		name              string
-		msg               []byte
-		wantIsDiscoMsg    bool
-		wantIsGeneveEncap bool
+		name                    string
+		msg                     []byte
+		wantPacketLooksLikeType packetLooksLikeType
+		wantIsGeneveEncap       bool
 	}{
 		{
-			name:              "naked disco",
-			msg:               nakedDisco,
-			wantIsDiscoMsg:    true,
-			wantIsGeneveEncap: false,
+			name:                    "STUN binding success response",
+			msg:                     stun.Response(stun.NewTxID(), netip.MustParseAddrPort("127.0.0.1:1")),
+			wantPacketLooksLikeType: packetLooksLikeSTUNBinding,
+			wantIsGeneveEncap:       false,
 		},
 		{
-			name:              "geneve encap disco",
-			msg:               geneveEncapDisco,
-			wantIsDiscoMsg:    true,
-			wantIsGeneveEncap: true,
+			name:                    "naked disco",
+			msg:                     nakedDisco,
+			wantPacketLooksLikeType: packetLooksLikeDisco,
+			wantIsGeneveEncap:       false,
 		},
 		{
-			name:              "geneve encap disco nonzero geneve version",
-			msg:               geneveEncapDiscoNonZeroGeneveVersion,
-			wantIsDiscoMsg:    false,
-			wantIsGeneveEncap: false,
+			name:                    "geneve encap disco",
+			msg:                     geneveEncapDisco,
+			wantPacketLooksLikeType: packetLooksLikeDisco,
+			wantIsGeneveEncap:       true,
 		},
 		{
-			name:              "geneve encap disco nonzero geneve reserved bits",
-			msg:               geneveEncapDiscoNonZeroGeneveReservedBits,
-			wantIsDiscoMsg:    false,
-			wantIsGeneveEncap: false,
+			name:                    "geneve encap too short disco",
+			msg:                     geneveEncapDisco[:len(geneveEncapDisco)-key.DiscoPublicRawLen],
+			wantPacketLooksLikeType: packetLooksLikeWireGuard,
+			wantIsGeneveEncap:       false,
 		},
 		{
-			name:              "geneve encap disco nonzero geneve vni lsb",
-			msg:               geneveEncapDiscoNonZeroGeneveVNILSB,
-			wantIsDiscoMsg:    false,
-			wantIsGeneveEncap: false,
+			name:                    "geneve encap disco nonzero geneve version",
+			msg:                     geneveEncapDiscoNonZeroGeneveVersion,
+			wantPacketLooksLikeType: packetLooksLikeWireGuard,
+			wantIsGeneveEncap:       false,
 		},
 		{
-			name:              "geneve encap wireguard",
-			msg:               geneveEncapWireGuard,
-			wantIsDiscoMsg:    false,
-			wantIsGeneveEncap: false,
+			name:                    "geneve encap disco nonzero geneve reserved bits",
+			msg:                     geneveEncapDiscoNonZeroGeneveReservedBits,
+			wantPacketLooksLikeType: packetLooksLikeWireGuard,
+			wantIsGeneveEncap:       false,
 		},
 		{
-			name:              "naked WireGuard Initiation type",
-			msg:               nakedWireGuardInitiation,
-			wantIsDiscoMsg:    false,
-			wantIsGeneveEncap: false,
+			name:                    "geneve encap disco nonzero geneve vni lsb",
+			msg:                     geneveEncapDiscoNonZeroGeneveVNILSB,
+			wantPacketLooksLikeType: packetLooksLikeWireGuard,
+			wantIsGeneveEncap:       false,
 		},
 		{
-			name:              "naked WireGuard Response type",
-			msg:               nakedWireGuardResponse,
-			wantIsDiscoMsg:    false,
-			wantIsGeneveEncap: false,
+			name:                    "geneve encap wireguard",
+			msg:                     geneveEncapWireGuard,
+			wantPacketLooksLikeType: packetLooksLikeWireGuard,
+			wantIsGeneveEncap:       true,
 		},
 		{
-			name:              "naked WireGuard Cookie Reply type",
-			msg:               nakedWireGuardCookieReply,
-			wantIsDiscoMsg:    false,
-			wantIsGeneveEncap: false,
+			name:                    "naked WireGuard Initiation type",
+			msg:                     nakedWireGuardInitiation,
+			wantPacketLooksLikeType: packetLooksLikeWireGuard,
+			wantIsGeneveEncap:       false,
 		},
 		{
-			name:              "naked WireGuard Transport type",
-			msg:               nakedWireGuardTransport,
-			wantIsDiscoMsg:    false,
-			wantIsGeneveEncap: false,
+			name:                    "naked WireGuard Response type",
+			msg:                     nakedWireGuardResponse,
+			wantPacketLooksLikeType: packetLooksLikeWireGuard,
+			wantIsGeneveEncap:       false,
+		},
+		{
+			name:                    "naked WireGuard Cookie Reply type",
+			msg:                     nakedWireGuardCookieReply,
+			wantPacketLooksLikeType: packetLooksLikeWireGuard,
+			wantIsGeneveEncap:       false,
+		},
+		{
+			name:                    "naked WireGuard Transport type",
+			msg:                     nakedWireGuardTransport,
+			wantPacketLooksLikeType: packetLooksLikeWireGuard,
+			wantIsGeneveEncap:       false,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotIsDiscoMsg, gotIsGeneveEncap := isDiscoMaybeGeneve(tt.msg)
-			if gotIsDiscoMsg != tt.wantIsDiscoMsg {
-				t.Errorf("isDiscoMaybeGeneve() gotIsDiscoMsg = %v, want %v", gotIsDiscoMsg, tt.wantIsDiscoMsg)
+			gotPacketLooksLikeType, gotIsGeneveEncap := packetLooksLike(tt.msg)
+			if gotPacketLooksLikeType != tt.wantPacketLooksLikeType {
+				t.Errorf("packetLooksLike() gotPacketLooksLikeType = %v, want %v", gotPacketLooksLikeType, tt.wantPacketLooksLikeType)
 			}
 			if gotIsGeneveEncap != tt.wantIsGeneveEncap {
-				t.Errorf("isDiscoMaybeGeneve() gotIsGeneveEncap = %v, want %v", gotIsGeneveEncap, tt.wantIsGeneveEncap)
+				t.Errorf("packetLooksLike() gotIsGeneveEncap = %v, want %v", gotIsGeneveEncap, tt.wantIsGeneveEncap)
 			}
 		})
 	}
@@ -3363,6 +3379,198 @@ func Test_virtualNetworkID(t *testing.T) {
 			}
 			if v.get() != tt.want {
 				t.Fatalf("get(): %v != want: %v", v.get(), tt.want)
+			}
+		})
+	}
+}
+
+func Test_peerAPIIfCandidateRelayServer(t *testing.T) {
+	selfOnlyIPv4 := &tailcfg.Node{
+		Cap: math.MinInt32,
+		Addresses: []netip.Prefix{
+			netip.MustParsePrefix("1.1.1.1/32"),
+		},
+	}
+	selfOnlyIPv6 := selfOnlyIPv4.Clone()
+	selfOnlyIPv6.Addresses[0] = netip.MustParsePrefix("::1/128")
+
+	peerHostinfo := &tailcfg.Hostinfo{
+		Services: []tailcfg.Service{
+			{
+				Proto: tailcfg.PeerAPI4,
+				Port:  4,
+			},
+			{
+				Proto: tailcfg.PeerAPI6,
+				Port:  6,
+			},
+		},
+	}
+	peerOnlyIPv4 := &tailcfg.Node{
+		Cap: math.MinInt32,
+		Addresses: []netip.Prefix{
+			netip.MustParsePrefix("2.2.2.2/32"),
+		},
+		Hostinfo: peerHostinfo.View(),
+	}
+
+	peerOnlyIPv6 := peerOnlyIPv4.Clone()
+	peerOnlyIPv6.Addresses[0] = netip.MustParsePrefix("::2/128")
+
+	peerOnlyIPv4ZeroCapVer := peerOnlyIPv4.Clone()
+	peerOnlyIPv4ZeroCapVer.Cap = 0
+
+	peerOnlyIPv4NilHostinfo := peerOnlyIPv4.Clone()
+	peerOnlyIPv4NilHostinfo.Hostinfo = tailcfg.HostinfoView{}
+
+	tests := []struct {
+		name string
+		filt *filter.Filter
+		self tailcfg.NodeView
+		peer tailcfg.NodeView
+		want netip.AddrPort
+	}{
+		{
+			name: "match v4",
+			filt: filter.New([]filtertype.Match{
+				{
+					Srcs: []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
+					Caps: []filtertype.CapMatch{
+						{
+							Dst: netip.MustParsePrefix("1.1.1.1/32"),
+							Cap: tailcfg.PeerCapabilityRelayTarget,
+						},
+					},
+				},
+			}, nil, nil, nil, nil, nil),
+			self: selfOnlyIPv4.View(),
+			peer: peerOnlyIPv4.View(),
+			want: netip.MustParseAddrPort("2.2.2.2:4"),
+		},
+		{
+			name: "match v6",
+			filt: filter.New([]filtertype.Match{
+				{
+					Srcs: []netip.Prefix{netip.MustParsePrefix("::2/128")},
+					Caps: []filtertype.CapMatch{
+						{
+							Dst: netip.MustParsePrefix("::1/128"),
+							Cap: tailcfg.PeerCapabilityRelayTarget,
+						},
+					},
+				},
+			}, nil, nil, nil, nil, nil),
+			self: selfOnlyIPv6.View(),
+			peer: peerOnlyIPv6.View(),
+			want: netip.MustParseAddrPort("[::2]:6"),
+		},
+		{
+			name: "no match dst",
+			filt: filter.New([]filtertype.Match{
+				{
+					Srcs: []netip.Prefix{netip.MustParsePrefix("::2/128")},
+					Caps: []filtertype.CapMatch{
+						{
+							Dst: netip.MustParsePrefix("::3/128"),
+							Cap: tailcfg.PeerCapabilityRelayTarget,
+						},
+					},
+				},
+			}, nil, nil, nil, nil, nil),
+			self: selfOnlyIPv6.View(),
+			peer: peerOnlyIPv6.View(),
+		},
+		{
+			name: "no match peer cap",
+			filt: filter.New([]filtertype.Match{
+				{
+					Srcs: []netip.Prefix{netip.MustParsePrefix("::2/128")},
+					Caps: []filtertype.CapMatch{
+						{
+							Dst: netip.MustParsePrefix("::1/128"),
+							Cap: tailcfg.PeerCapabilityIngress,
+						},
+					},
+				},
+			}, nil, nil, nil, nil, nil),
+			self: selfOnlyIPv6.View(),
+			peer: peerOnlyIPv6.View(),
+		},
+		{
+			name: "cap ver not relay capable",
+			filt: filter.New([]filtertype.Match{
+				{
+					Srcs: []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
+					Caps: []filtertype.CapMatch{
+						{
+							Dst: netip.MustParsePrefix("1.1.1.1/32"),
+							Cap: tailcfg.PeerCapabilityRelayTarget,
+						},
+					},
+				},
+			}, nil, nil, nil, nil, nil),
+			self: peerOnlyIPv4.View(),
+			peer: peerOnlyIPv4ZeroCapVer.View(),
+		},
+		{
+			name: "nil filt",
+			filt: nil,
+			self: selfOnlyIPv4.View(),
+			peer: peerOnlyIPv4.View(),
+		},
+		{
+			name: "nil self",
+			filt: filter.New([]filtertype.Match{
+				{
+					Srcs: []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
+					Caps: []filtertype.CapMatch{
+						{
+							Dst: netip.MustParsePrefix("1.1.1.1/32"),
+							Cap: tailcfg.PeerCapabilityRelayTarget,
+						},
+					},
+				},
+			}, nil, nil, nil, nil, nil),
+			self: tailcfg.NodeView{},
+			peer: peerOnlyIPv4.View(),
+		},
+		{
+			name: "nil peer",
+			filt: filter.New([]filtertype.Match{
+				{
+					Srcs: []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
+					Caps: []filtertype.CapMatch{
+						{
+							Dst: netip.MustParsePrefix("1.1.1.1/32"),
+							Cap: tailcfg.PeerCapabilityRelayTarget,
+						},
+					},
+				},
+			}, nil, nil, nil, nil, nil),
+			self: selfOnlyIPv4.View(),
+			peer: tailcfg.NodeView{},
+		},
+		{
+			name: "nil peer hostinfo",
+			filt: filter.New([]filtertype.Match{
+				{
+					Srcs: []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
+					Caps: []filtertype.CapMatch{
+						{
+							Dst: netip.MustParsePrefix("1.1.1.1/32"),
+							Cap: tailcfg.PeerCapabilityRelayTarget,
+						},
+					},
+				},
+			}, nil, nil, nil, nil, nil),
+			self: selfOnlyIPv4.View(),
+			peer: peerOnlyIPv4NilHostinfo.View(),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := peerAPIIfCandidateRelayServer(tt.filt, tt.self, tt.peer); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("peerAPIIfCandidateRelayServer() = %v, want %v", got, tt.want)
 			}
 		})
 	}

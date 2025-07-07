@@ -8,10 +8,11 @@ package relayserver
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
-	"net/netip"
 	"sync"
+	"time"
 
 	"tailscale.com/envknob"
 	"tailscale.com/feature"
@@ -49,11 +50,11 @@ func newExtension(logf logger.Logf, _ ipnext.SafeBackend) (ipnext.Extension, err
 type extension struct {
 	logf logger.Logf
 
-	mu                     sync.Mutex // guards the following fields
-	shutdown               bool
-	port                   *int        // ipn.Prefs.RelayServerPort, nil if disabled
-	hasNodeAttrRelayServer bool        // tailcfg.NodeAttrRelayServer
-	server                 relayServer // lazily initialized
+	mu                            sync.Mutex // guards the following fields
+	shutdown                      bool
+	port                          *int        // ipn.Prefs.RelayServerPort, nil if disabled
+	hasNodeAttrDisableRelayServer bool        // tailcfg.NodeAttrDisableRelayServer
+	server                        relayServer // lazily initialized
 }
 
 // relayServer is the interface of [udprelay.Server].
@@ -80,8 +81,8 @@ func (e *extension) Init(host ipnext.Host) error {
 func (e *extension) selfNodeViewChanged(nodeView tailcfg.NodeView) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.hasNodeAttrRelayServer = nodeView.HasCap(tailcfg.NodeAttrRelayServer)
-	if !e.hasNodeAttrRelayServer && e.server != nil {
+	e.hasNodeAttrDisableRelayServer = nodeView.HasCap(tailcfg.NodeAttrDisableRelayServer)
+	if e.hasNodeAttrDisableRelayServer && e.server != nil {
 		e.server.Close()
 		e.server = nil
 	}
@@ -129,14 +130,14 @@ func (e *extension) relayServerOrInit() (relayServer, error) {
 	if e.port == nil {
 		return nil, errors.New("relay server is not configured")
 	}
-	if !e.hasNodeAttrRelayServer {
-		return nil, errors.New("no relay:server node attribute")
+	if e.hasNodeAttrDisableRelayServer {
+		return nil, errors.New("disable-relay-server node attribute is present")
 	}
 	if !envknob.UseWIPCode() {
 		return nil, errors.New("TAILSCALE_USE_WIP_CODE envvar is not set")
 	}
 	var err error
-	e.server, _, err = udprelay.NewServer(*e.port, []netip.Addr{netip.MustParseAddr("127.0.0.1")})
+	e.server, err = udprelay.NewServer(e.logf, *e.port, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -185,6 +186,12 @@ func handlePeerAPIRelayAllocateEndpoint(h ipnlocal.PeerAPIHandler, w http.Respon
 	}
 	ep, err := rs.AllocateEndpoint(allocateEndpointReq.DiscoKeys[0], allocateEndpointReq.DiscoKeys[1])
 	if err != nil {
+		var notReady udprelay.ErrServerNotReady
+		if errors.As(err, &notReady) {
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", notReady.RetryAfter.Round(time.Second)/time.Second))
+			httpErrAndLog(err.Error(), http.StatusServiceUnavailable)
+			return
+		}
 		httpErrAndLog(err.Error(), http.StatusInternalServerError)
 		return
 	}

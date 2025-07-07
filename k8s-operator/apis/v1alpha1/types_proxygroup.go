@@ -88,7 +88,11 @@ type ProxyGroupSpec struct {
 
 type ProxyGroupStatus struct {
 	// List of status conditions to indicate the status of the ProxyGroup
-	// resources. Known condition types are `ProxyGroupReady`.
+	// resources. Known condition types are `ProxyGroupReady`, `ProxyGroupAvailable`.
+	// `ProxyGroupReady` indicates all ProxyGroup resources are fully reconciled
+	// and ready. `ProxyGroupAvailable` indicates that at least one proxy is
+	// ready to serve traffic.
+	//
 	// +listType=map
 	// +listMapKey=type
 	// +optional
@@ -111,6 +115,10 @@ type TailnetDevice struct {
 	// assigned to the device.
 	// +optional
 	TailnetIPs []string `json:"tailnetIPs,omitempty"`
+
+	// StaticEndpoints are user configured, 'static' endpoints by which tailnet peers can reach this device.
+	// +optional
+	StaticEndpoints []string `json:"staticEndpoints,omitempty"`
 }
 
 // +kubebuilder:validation:Type=string

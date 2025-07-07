@@ -17,12 +17,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mattn/go-isatty"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tka"
 	"tailscale.com/tsconst"
 	"tailscale.com/types/key"
 	"tailscale.com/types/tkatype"
+	"tailscale.com/util/prompt"
 )
 
 var netlockCmd = &ffcli.Command{
@@ -326,6 +328,9 @@ func runNetworkLockRemove(ctx context.Context, args []string) error {
 	if !st.Enabled {
 		return errors.New("tailnet lock is not enabled")
 	}
+	if len(st.TrustedKeys) == 1 {
+		return errors.New("cannot remove the last trusted signing key; use 'tailscale lock disable' to disable tailnet lock instead, or add another signing key before removing one")
+	}
 
 	if nlRemoveArgs.resign {
 		// Validate we are not removing trust in ourselves while resigning. This is because
@@ -364,6 +369,18 @@ func runNetworkLockRemove(ctx context.Context, args []string) error {
 				if err := localClient.NetworkLockSign(ctx, nodeKey, []byte(rotationKey)); err != nil {
 					return fmt.Errorf("failed to sign %v: %w", nodeKey, err)
 				}
+			}
+		}
+	} else {
+		if isatty.IsTerminal(os.Stdout.Fd()) {
+			fmt.Printf(`Warning
+Removal of a signing key(s) without resigning nodes (--re-sign=false)
+will cause any nodes signed by the the given key(s) to be locked out
+of the Tailscale network. Proceed with caution.
+`)
+			if !prompt.YesNo("Are you sure you want to remove the signing key(s)?") {
+				fmt.Printf("aborting removal of signing key(s)\n")
+				os.Exit(0)
 			}
 		}
 	}
@@ -606,7 +623,7 @@ func nlDescribeUpdate(update ipnstate.NetworkLockUpdate, color bool) (string, er
 	printKey := func(key *tka.Key, prefix string) {
 		fmt.Fprintf(&stanza, "%sType: %s\n", prefix, key.Kind.String())
 		if keyID, err := key.ID(); err == nil {
-			fmt.Fprintf(&stanza, "%sKeyID: %x\n", prefix, keyID)
+			fmt.Fprintf(&stanza, "%sKeyID: tlpub:%x\n", prefix, keyID)
 		} else {
 			// Older versions of the client shouldn't explode when they encounter an
 			// unknown key type.
@@ -622,16 +639,20 @@ func nlDescribeUpdate(update ipnstate.NetworkLockUpdate, color bool) (string, er
 		return "", fmt.Errorf("decoding: %w", err)
 	}
 
-	fmt.Fprintf(&stanza, "%supdate %x (%s)%s\n", terminalYellow, update.Hash, update.Change, terminalClear)
+	tkaHead, err := aum.Hash().MarshalText()
+	if err != nil {
+		return "", fmt.Errorf("decoding AUM hash: %w", err)
+	}
+	fmt.Fprintf(&stanza, "%supdate %s (%s)%s\n", terminalYellow, string(tkaHead), update.Change, terminalClear)
 
 	switch update.Change {
 	case tka.AUMAddKey.String():
 		printKey(aum.Key, "")
 	case tka.AUMRemoveKey.String():
-		fmt.Fprintf(&stanza, "KeyID: %x\n", aum.KeyID)
+		fmt.Fprintf(&stanza, "KeyID: tlpub:%x\n", aum.KeyID)
 
 	case tka.AUMUpdateKey.String():
-		fmt.Fprintf(&stanza, "KeyID: %x\n", aum.KeyID)
+		fmt.Fprintf(&stanza, "KeyID: tlpub:%x\n", aum.KeyID)
 		if aum.Votes != nil {
 			fmt.Fprintf(&stanza, "Votes: %d\n", aum.Votes)
 		}

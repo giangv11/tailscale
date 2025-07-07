@@ -6,6 +6,16 @@
 # hash of this repository as produced by ./cmd/mkversion.
 # This is the image build mechanim used to build the official Tailscale
 # container images.
+#
+# If you want to build local images for testing, you can use make, which provides few convenience wrappers around this script.
+#
+# To build a Tailscale image and push to the local docker registry:
+
+#   $ REPO=local/tailscale TAGS=v0.0.1 PLATFORM=local  make publishdevimage
+#
+# To build a Tailscale image and push to a remote docker registry:
+#
+#   $ REPO=<your-registry>/<your-repo>/tailscale TAGS=v0.0.1  make publishdevimage
 
 set -eu
 
@@ -89,6 +99,24 @@ case "$TARGET" in
       --target="${PLATFORM}" \
       --annotations="${ANNOTATIONS}" \
       /usr/local/bin/k8s-nameserver
+    ;;
+  tsidp)
+    DEFAULT_REPOS="tailscale/tsidp"
+    REPOS="${REPOS:-${DEFAULT_REPOS}}"
+    go run github.com/tailscale/mkctr \
+      --gopaths="tailscale.com/cmd/tsidp:/usr/local/bin/tsidp" \
+      --ldflags=" \
+        -X tailscale.com/version.longStamp=${VERSION_LONG} \
+        -X tailscale.com/version.shortStamp=${VERSION_SHORT} \
+        -X tailscale.com/version.gitCommitStamp=${VERSION_GIT_HASH}" \
+      --base="${BASE}" \
+      --tags="${TAGS}" \
+      --gotags="ts_package_container" \
+      --repos="${REPOS}" \
+      --push="${PUSH}" \
+      --target="${PLATFORM}" \
+      --annotations="${ANNOTATIONS}" \
+      /usr/local/bin/tsidp
     ;;
   *)
     echo "unknown target: $TARGET"

@@ -16,7 +16,6 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"net/url"
 	"os"
 	"reflect"
 	"runtime"
@@ -240,10 +239,6 @@ func NewDirect(opts Options) (*Direct, error) {
 		opts.ControlKnobs = &controlknobs.Knobs{}
 	}
 	opts.ServerURL = strings.TrimRight(opts.ServerURL, "/")
-	serverURL, err := url.Parse(opts.ServerURL)
-	if err != nil {
-		return nil, err
-	}
 	if opts.Clock == nil {
 		opts.Clock = tstime.StdClock{}
 	}
@@ -273,7 +268,7 @@ func NewDirect(opts Options) (*Direct, error) {
 		tr := http.DefaultTransport.(*http.Transport).Clone()
 		tr.Proxy = tshttpproxy.ProxyFromEnvironment
 		tshttpproxy.SetTransportGetProxyConnectHeader(tr)
-		tr.TLSClientConfig = tlsdial.Config(serverURL.Hostname(), opts.HealthTracker, tr.TLSClientConfig)
+		tr.TLSClientConfig = tlsdial.Config(opts.HealthTracker, tr.TLSClientConfig)
 		var dialFunc netx.DialFunc
 		dialFunc, interceptedDial = makeScreenTimeDetectingDialFunc(opts.Dialer.SystemDial)
 		tr.DialContext = dnscache.Dialer(dialFunc, dnsCache)
@@ -1623,9 +1618,9 @@ func postPingResult(start time.Time, logf logger.Logf, c *http.Client, pr *tailc
 	return nil
 }
 
-// ReportHealthChange reports to the control plane a change to this node's
+// ReportWarnableChange reports to the control plane a change to this node's
 // health. w must be non-nil. us can be nil to indicate a healthy state for w.
-func (c *Direct) ReportHealthChange(w *health.Warnable, us *health.UnhealthyState) {
+func (c *Direct) ReportWarnableChange(w *health.Warnable, us *health.UnhealthyState) {
 	if w == health.NetworkStatusWarnable || w == health.IPNStateWarnable || w == health.LoginStateWarnable {
 		// We don't report these. These include things like the network is down
 		// (in which case we can't report anyway) or the user wanted things

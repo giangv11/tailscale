@@ -57,7 +57,7 @@ type Client struct {
 	TLSConfig     *tls.Config        // optional; nil means default
 	HealthTracker *health.Tracker    // optional; used if non-nil only
 	DNSCache      *dnscache.Resolver // optional; nil means no caching
-	MeshKey       string             // optional; for trusted clients
+	MeshKey       key.DERPMesh       // optional; for trusted clients
 	IsProber      bool               // optional; for probers to optional declare themselves as such
 
 	// WatchConnectionChanges is whether the client wishes to subscribe to
@@ -647,7 +647,10 @@ func (c *Client) dialRegion(ctx context.Context, reg *tailcfg.DERPRegion) (net.C
 }
 
 func (c *Client) tlsClient(nc net.Conn, node *tailcfg.DERPNode) *tls.Conn {
-	tlsConf := tlsdial.Config(c.tlsServerName(node), c.HealthTracker, c.TLSConfig)
+	tlsConf := tlsdial.Config(c.HealthTracker, c.TLSConfig)
+	// node is allowed to be nil here, tlsServerName falls back to using the URL
+	// if node is nil.
+	tlsConf.ServerName = c.tlsServerName(node)
 	if node != nil {
 		if node.InsecureForTests {
 			tlsConf.InsecureSkipVerify = true
