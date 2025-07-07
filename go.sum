@@ -863,8 +863,8 @@ github.com/ryancurrah/gomodguard v1.3.1 h1:fH+fUg+ngsQO0ruZXXHnA/2aNllWA1whly4a6
 github.com/ryancurrah/gomodguard v1.3.1/go.mod h1:DGFHzEhi6iJ0oIDfMuo3TgrS+L9gZvrEfmjjuelnRU0=
 github.com/ryanrolds/sqlclosecheck v0.5.1 h1:dibWW826u0P8jNLsLN+En7+RqWWTYrjCB9fJfSfdyCU=
 github.com/ryanrolds/sqlclosecheck v0.5.1/go.mod h1:2g3dUjoS6AL4huFdv6wn55WpLIDjY7ZgUR4J8HOO/XQ=
-github.com/ryoon/wireguard-go v0.0.0-20250210095301-74b891369f2f h1:pEcqoz++KW3qGynvpcdfeLlF47saGItDvNMFk7A8eQs=
-github.com/ryoon/wireguard-go v0.0.0-20250210095301-74b891369f2f/go.mod h1:BOm5fXUBFM+m9woLNBoxI9TaBXXhGNP50LX/TGIvGb4=
+github.com/nuclearkev/wireguard-go v0.0.0-20250707195906-556d1d337372 h1:/jub6Lykz0zxUeD55tEtuLNntBU1sOWgnOllK6HREoA=
+github.com/nuclearkev/wireguard-go v0.0.0-20250707195906-556d1d337372/go.mod h1:BOm5fXUBFM+m9woLNBoxI9TaBXXhGNP50LX/TGIvGb4=
 github.com/safchain/ethtool v0.3.0 h1:gimQJpsI6sc1yIqP/y8GYgiXn/NjgvpM0RNoWLVVmP0=
 github.com/safchain/ethtool v0.3.0/go.mod h1:SA9BwrgyAqNo7M+uaL6IYbxpm5wk3L7Mm6ocLW+CJUs=
 github.com/sanposhiho/wastedassign/v2 v2.0.7 h1:J+6nrY4VW+gC9xFzUc+XjPD3g3wF3je/NsJFwFK7Uxc=
