@@ -28,10 +28,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn"
+	kube "tailscale.com/k8s-operator"
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/kube/k8s-proxy/conf"
 	"tailscale.com/kube/kubetypes"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
+	"tailscale.com/types/opt"
 	"tailscale.com/types/ptr"
 )
 
@@ -629,7 +633,7 @@ func TestProxyGroupWithStaticEndpoints(t *testing.T) {
 
 			reconciler := &ProxyGroupReconciler{
 				tsNamespace:       tsNamespace,
-				proxyImage:        testProxyImage,
+				tsProxyImage:      testProxyImage,
 				defaultTags:       []string{"tag:test-tag"},
 				tsFirewallMode:    "auto",
 				defaultProxyClass: "default-pc",
@@ -772,7 +776,7 @@ func TestProxyGroupWithStaticEndpoints(t *testing.T) {
 			t.Run("delete_and_cleanup", func(t *testing.T) {
 				reconciler := &ProxyGroupReconciler{
 					tsNamespace:       tsNamespace,
-					proxyImage:        testProxyImage,
+					tsProxyImage:      testProxyImage,
 					defaultTags:       []string{"tag:test-tag"},
 					tsFirewallMode:    "auto",
 					defaultProxyClass: "default-pc",
@@ -815,6 +819,7 @@ func TestProxyGroup(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "test",
 			Finalizers: []string{"tailscale.com/finalizer"},
+			Generation: 1,
 		},
 		Spec: tsapi.ProxyGroupSpec{
 			Type: tsapi.ProxyGroupTypeEgress,
@@ -832,7 +837,7 @@ func TestProxyGroup(t *testing.T) {
 	cl := tstest.NewClock(tstest.ClockOpts{})
 	reconciler := &ProxyGroupReconciler{
 		tsNamespace:       tsNamespace,
-		proxyImage:        testProxyImage,
+		tsProxyImage:      testProxyImage,
 		defaultTags:       []string{"tag:test-tag"},
 		tsFirewallMode:    "auto",
 		defaultProxyClass: "default-pc",
@@ -856,9 +861,12 @@ func TestProxyGroup(t *testing.T) {
 		expectReconciled(t, reconciler, "", pg.Name)
 
 		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupAvailable, metav1.ConditionFalse, reasonProxyGroupCreating, "0/2 ProxyGroup pods running", 0, cl, zl.Sugar())
-		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupReady, metav1.ConditionFalse, reasonProxyGroupCreating, "the ProxyGroup's ProxyClass \"default-pc\" is not yet in a ready state, waiting...", 0, cl, zl.Sugar())
+		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupReady, metav1.ConditionFalse, reasonProxyGroupCreating, "the ProxyGroup's ProxyClass \"default-pc\" is not yet in a ready state, waiting...", 1, cl, zl.Sugar())
 		expectEqual(t, fc, pg)
 		expectProxyGroupResources(t, fc, pg, false, pc)
+		if kube.ProxyGroupAvailable(pg) {
+			t.Fatal("expected ProxyGroup to not be available")
+		}
 	})
 
 	t.Run("observe_ProxyGroupCreating_status_reason", func(t *testing.T) {
@@ -874,13 +882,19 @@ func TestProxyGroup(t *testing.T) {
 		if err := fc.Status().Update(t.Context(), pc); err != nil {
 			t.Fatal(err)
 		}
-
+		pg.ObjectMeta.Generation = 2
+		mustUpdate(t, fc, "", pg.Name, func(p *tsapi.ProxyGroup) {
+			p.ObjectMeta.Generation = pg.ObjectMeta.Generation
+		})
 		expectReconciled(t, reconciler, "", pg.Name)
 
-		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupReady, metav1.ConditionFalse, reasonProxyGroupCreating, "0/2 ProxyGroup pods running", 0, cl, zl.Sugar())
+		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupReady, metav1.ConditionFalse, reasonProxyGroupCreating, "0/2 ProxyGroup pods running", 2, cl, zl.Sugar())
 		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupAvailable, metav1.ConditionFalse, reasonProxyGroupCreating, "0/2 ProxyGroup pods running", 0, cl, zl.Sugar())
 		expectEqual(t, fc, pg)
 		expectProxyGroupResources(t, fc, pg, true, pc)
+		if kube.ProxyGroupAvailable(pg) {
+			t.Fatal("expected ProxyGroup to not be available")
+		}
 		if expected := 1; reconciler.egressProxyGroups.Len() != expected {
 			t.Fatalf("expected %d egress ProxyGroups, got %d", expected, reconciler.egressProxyGroups.Len())
 		}
@@ -902,6 +916,10 @@ func TestProxyGroup(t *testing.T) {
 
 	t.Run("simulate_successful_device_auth", func(t *testing.T) {
 		addNodeIDToStateSecrets(t, fc, pg)
+		pg.ObjectMeta.Generation = 3
+		mustUpdate(t, fc, "", pg.Name, func(p *tsapi.ProxyGroup) {
+			p.ObjectMeta.Generation = pg.ObjectMeta.Generation
+		})
 		expectReconciled(t, reconciler, "", pg.Name)
 
 		pg.Status.Devices = []tsapi.TailnetDevice{
@@ -914,10 +932,13 @@ func TestProxyGroup(t *testing.T) {
 				TailnetIPs: []string{"1.2.3.4", "::1"},
 			},
 		}
-		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupReady, metav1.ConditionTrue, reasonProxyGroupReady, reasonProxyGroupReady, 0, cl, zl.Sugar())
-		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupAvailable, metav1.ConditionTrue, reasonProxyGroupReady, "2/2 ProxyGroup pods running", 0, cl, zl.Sugar())
+		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupReady, metav1.ConditionTrue, reasonProxyGroupReady, reasonProxyGroupReady, 3, cl, zl.Sugar())
+		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupAvailable, metav1.ConditionTrue, reasonProxyGroupAvailable, "2/2 ProxyGroup pods running", 0, cl, zl.Sugar())
 		expectEqual(t, fc, pg)
 		expectProxyGroupResources(t, fc, pg, true, pc)
+		if !kube.ProxyGroupAvailable(pg) {
+			t.Fatal("expected ProxyGroup to be available")
+		}
 	})
 
 	t.Run("scale_up_to_3", func(t *testing.T) {
@@ -926,15 +947,15 @@ func TestProxyGroup(t *testing.T) {
 			p.Spec = pg.Spec
 		})
 		expectReconciled(t, reconciler, "", pg.Name)
-		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupReady, metav1.ConditionFalse, reasonProxyGroupCreating, "2/3 ProxyGroup pods running", 0, cl, zl.Sugar())
+		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupReady, metav1.ConditionFalse, reasonProxyGroupCreating, "2/3 ProxyGroup pods running", 3, cl, zl.Sugar())
 		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupAvailable, metav1.ConditionTrue, reasonProxyGroupCreating, "2/3 ProxyGroup pods running", 0, cl, zl.Sugar())
 		expectEqual(t, fc, pg)
 		expectProxyGroupResources(t, fc, pg, true, pc)
 
 		addNodeIDToStateSecrets(t, fc, pg)
 		expectReconciled(t, reconciler, "", pg.Name)
-		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupReady, metav1.ConditionTrue, reasonProxyGroupReady, reasonProxyGroupReady, 0, cl, zl.Sugar())
-		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupAvailable, metav1.ConditionTrue, reasonProxyGroupReady, "3/3 ProxyGroup pods running", 0, cl, zl.Sugar())
+		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupReady, metav1.ConditionTrue, reasonProxyGroupReady, reasonProxyGroupReady, 3, cl, zl.Sugar())
+		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupAvailable, metav1.ConditionTrue, reasonProxyGroupAvailable, "3/3 ProxyGroup pods running", 0, cl, zl.Sugar())
 		pg.Status.Devices = append(pg.Status.Devices, tsapi.TailnetDevice{
 			Hostname:   "hostname-nodeid-2",
 			TailnetIPs: []string{"1.2.3.4", "::1"},
@@ -952,7 +973,7 @@ func TestProxyGroup(t *testing.T) {
 		expectReconciled(t, reconciler, "", pg.Name)
 
 		pg.Status.Devices = pg.Status.Devices[:1] // truncate to only the first device.
-		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupAvailable, metav1.ConditionTrue, reasonProxyGroupReady, "1/1 ProxyGroup pods running", 0, cl, zl.Sugar())
+		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupAvailable, metav1.ConditionTrue, reasonProxyGroupAvailable, "1/1 ProxyGroup pods running", 0, cl, zl.Sugar())
 		expectEqual(t, fc, pg)
 		expectProxyGroupResources(t, fc, pg, true, pc)
 	})
@@ -1025,12 +1046,12 @@ func TestProxyGroupTypes(t *testing.T) {
 
 	zl, _ := zap.NewDevelopment()
 	reconciler := &ProxyGroupReconciler{
-		tsNamespace: tsNamespace,
-		proxyImage:  testProxyImage,
-		Client:      fc,
-		l:           zl.Sugar(),
-		tsClient:    &fakeTSClient{},
-		clock:       tstest.NewClock(tstest.ClockOpts{}),
+		tsNamespace:  tsNamespace,
+		tsProxyImage: testProxyImage,
+		Client:       fc,
+		l:            zl.Sugar(),
+		tsClient:     &fakeTSClient{},
+		clock:        tstest.NewClock(tstest.ClockOpts{}),
 	}
 
 	t.Run("egress_type", func(t *testing.T) {
@@ -1047,7 +1068,7 @@ func TestProxyGroupTypes(t *testing.T) {
 		mustCreate(t, fc, pg)
 
 		expectReconciled(t, reconciler, "", pg.Name)
-		verifyProxyGroupCounts(t, reconciler, 0, 1)
+		verifyProxyGroupCounts(t, reconciler, 0, 1, 0)
 
 		sts := &appsv1.StatefulSet{}
 		if err := fc.Get(t.Context(), client.ObjectKey{Namespace: tsNamespace, Name: pg.Name}, sts); err != nil {
@@ -1161,7 +1182,7 @@ func TestProxyGroupTypes(t *testing.T) {
 		}
 
 		expectReconciled(t, reconciler, "", pg.Name)
-		verifyProxyGroupCounts(t, reconciler, 1, 2)
+		verifyProxyGroupCounts(t, reconciler, 1, 2, 0)
 
 		sts := &appsv1.StatefulSet{}
 		if err := fc.Get(t.Context(), client.ObjectKey{Namespace: tsNamespace, Name: pg.Name}, sts); err != nil {
@@ -1198,6 +1219,203 @@ func TestProxyGroupTypes(t *testing.T) {
 			t.Errorf("unexpected volume mounts (-want +got):\n%s", diff)
 		}
 	})
+
+	t.Run("kubernetes_api_server_type", func(t *testing.T) {
+		pg := &tsapi.ProxyGroup{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-k8s-apiserver",
+				UID:  "test-k8s-apiserver-uid",
+			},
+			Spec: tsapi.ProxyGroupSpec{
+				Type:     tsapi.ProxyGroupTypeKubernetesAPIServer,
+				Replicas: ptr.To[int32](2),
+				KubeAPIServer: &tsapi.KubeAPIServerConfig{
+					Mode: ptr.To(tsapi.APIServerProxyModeNoAuth),
+				},
+			},
+		}
+		if err := fc.Create(t.Context(), pg); err != nil {
+			t.Fatal(err)
+		}
+
+		expectReconciled(t, reconciler, "", pg.Name)
+		verifyProxyGroupCounts(t, reconciler, 1, 2, 1)
+
+		sts := &appsv1.StatefulSet{}
+		if err := fc.Get(t.Context(), client.ObjectKey{Namespace: tsNamespace, Name: pg.Name}, sts); err != nil {
+			t.Fatalf("failed to get StatefulSet: %v", err)
+		}
+
+		// Verify the StatefulSet configuration for KubernetesAPIServer type.
+		if sts.Spec.Template.Spec.Containers[0].Name != mainContainerName {
+			t.Errorf("unexpected container name %s, want %s", sts.Spec.Template.Spec.Containers[0].Name, mainContainerName)
+		}
+		if sts.Spec.Template.Spec.Containers[0].Ports[0].ContainerPort != 443 {
+			t.Errorf("unexpected container port %d, want 443", sts.Spec.Template.Spec.Containers[0].Ports[0].ContainerPort)
+		}
+		if sts.Spec.Template.Spec.Containers[0].Ports[0].Name != "k8s-proxy" {
+			t.Errorf("unexpected port name %s, want k8s-proxy", sts.Spec.Template.Spec.Containers[0].Ports[0].Name)
+		}
+	})
+}
+
+func TestKubeAPIServerStatusConditionFlow(t *testing.T) {
+	pg := &tsapi.ProxyGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-k8s-apiserver",
+			UID:        "test-k8s-apiserver-uid",
+			Generation: 1,
+		},
+		Spec: tsapi.ProxyGroupSpec{
+			Type:     tsapi.ProxyGroupTypeKubernetesAPIServer,
+			Replicas: ptr.To[int32](1),
+			KubeAPIServer: &tsapi.KubeAPIServerConfig{
+				Mode: ptr.To(tsapi.APIServerProxyModeNoAuth),
+			},
+		},
+	}
+	stateSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pgStateSecretName(pg.Name, 0),
+			Namespace: tsNamespace,
+		},
+	}
+	fc := fake.NewClientBuilder().
+		WithScheme(tsapi.GlobalScheme).
+		WithObjects(pg, stateSecret).
+		WithStatusSubresource(pg).
+		Build()
+	r := &ProxyGroupReconciler{
+		tsNamespace:  tsNamespace,
+		tsProxyImage: testProxyImage,
+		Client:       fc,
+		l:            zap.Must(zap.NewDevelopment()).Sugar(),
+		tsClient:     &fakeTSClient{},
+		clock:        tstest.NewClock(tstest.ClockOpts{}),
+	}
+
+	expectReconciled(t, r, "", pg.Name)
+	pg.ObjectMeta.Finalizers = append(pg.ObjectMeta.Finalizers, FinalizerName)
+	tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupAvailable, metav1.ConditionFalse, reasonProxyGroupCreating, "", 0, r.clock, r.l)
+	tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupReady, metav1.ConditionFalse, reasonProxyGroupCreating, "", 1, r.clock, r.l)
+	expectEqual(t, fc, pg, omitPGStatusConditionMessages)
+
+	// Set kube-apiserver valid.
+	mustUpdateStatus(t, fc, "", pg.Name, func(p *tsapi.ProxyGroup) {
+		tsoperator.SetProxyGroupCondition(p, tsapi.KubeAPIServerProxyValid, metav1.ConditionTrue, reasonKubeAPIServerProxyValid, "", 1, r.clock, r.l)
+	})
+	expectReconciled(t, r, "", pg.Name)
+	tsoperator.SetProxyGroupCondition(pg, tsapi.KubeAPIServerProxyValid, metav1.ConditionTrue, reasonKubeAPIServerProxyValid, "", 1, r.clock, r.l)
+	tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupReady, metav1.ConditionFalse, reasonProxyGroupCreating, "", 1, r.clock, r.l)
+	expectEqual(t, fc, pg, omitPGStatusConditionMessages)
+
+	// Set available.
+	addNodeIDToStateSecrets(t, fc, pg)
+	expectReconciled(t, r, "", pg.Name)
+	pg.Status.Devices = []tsapi.TailnetDevice{
+		{
+			Hostname:   "hostname-nodeid-0",
+			TailnetIPs: []string{"1.2.3.4", "::1"},
+		},
+	}
+	tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupAvailable, metav1.ConditionTrue, reasonProxyGroupAvailable, "", 0, r.clock, r.l)
+	tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupReady, metav1.ConditionFalse, reasonProxyGroupCreating, "", 1, r.clock, r.l)
+	expectEqual(t, fc, pg, omitPGStatusConditionMessages)
+
+	// Set kube-apiserver configured.
+	mustUpdateStatus(t, fc, "", pg.Name, func(p *tsapi.ProxyGroup) {
+		tsoperator.SetProxyGroupCondition(p, tsapi.KubeAPIServerProxyConfigured, metav1.ConditionTrue, reasonKubeAPIServerProxyConfigured, "", 1, r.clock, r.l)
+	})
+	expectReconciled(t, r, "", pg.Name)
+	tsoperator.SetProxyGroupCondition(pg, tsapi.KubeAPIServerProxyConfigured, metav1.ConditionTrue, reasonKubeAPIServerProxyConfigured, "", 1, r.clock, r.l)
+	tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupReady, metav1.ConditionTrue, reasonProxyGroupReady, "", 1, r.clock, r.l)
+	expectEqual(t, fc, pg, omitPGStatusConditionMessages)
+}
+
+func TestKubeAPIServerType_DoesNotOverwriteServicesConfig(t *testing.T) {
+	fc := fake.NewClientBuilder().
+		WithScheme(tsapi.GlobalScheme).
+		WithStatusSubresource(&tsapi.ProxyGroup{}).
+		Build()
+
+	reconciler := &ProxyGroupReconciler{
+		tsNamespace:  tsNamespace,
+		tsProxyImage: testProxyImage,
+		Client:       fc,
+		l:            zap.Must(zap.NewDevelopment()).Sugar(),
+		tsClient:     &fakeTSClient{},
+		clock:        tstest.NewClock(tstest.ClockOpts{}),
+	}
+
+	pg := &tsapi.ProxyGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-k8s-apiserver",
+			UID:  "test-k8s-apiserver-uid",
+		},
+		Spec: tsapi.ProxyGroupSpec{
+			Type:     tsapi.ProxyGroupTypeKubernetesAPIServer,
+			Replicas: ptr.To[int32](1),
+			KubeAPIServer: &tsapi.KubeAPIServerConfig{
+				Mode: ptr.To(tsapi.APIServerProxyModeNoAuth), // Avoid needing to pre-create the static ServiceAccount.
+			},
+		},
+	}
+	if err := fc.Create(t.Context(), pg); err != nil {
+		t.Fatal(err)
+	}
+	expectReconciled(t, reconciler, "", pg.Name)
+
+	cfg := conf.VersionedConfig{
+		Version: "v1alpha1",
+		ConfigV1Alpha1: &conf.ConfigV1Alpha1{
+			AuthKey:  ptr.To("secret-authkey"),
+			State:    ptr.To(fmt.Sprintf("kube:%s", pgPodName(pg.Name, 0))),
+			App:      ptr.To(kubetypes.AppProxyGroupKubeAPIServer),
+			LogLevel: ptr.To("debug"),
+
+			Hostname: ptr.To("test-k8s-apiserver-0"),
+			APIServerProxy: &conf.APIServerProxyConfig{
+				Enabled:    opt.NewBool(true),
+				Mode:       ptr.To(kubetypes.APIServerProxyModeNoAuth),
+				IssueCerts: opt.NewBool(true),
+			},
+			LocalPort:          ptr.To(uint16(9002)),
+			HealthCheckEnabled: opt.NewBool(true),
+		},
+	}
+	cfgB, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("failed to marshal config: %v", err)
+	}
+
+	cfgSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            pgConfigSecretName(pg.Name, 0),
+			Namespace:       tsNamespace,
+			Labels:          pgSecretLabels(pg.Name, kubetypes.LabelSecretTypeConfig),
+			OwnerReferences: pgOwnerReference(pg),
+		},
+		Data: map[string][]byte{
+			kubetypes.KubeAPIServerConfigFile: cfgB,
+		},
+	}
+	expectEqual(t, fc, cfgSecret)
+
+	// Now simulate the kube-apiserver services reconciler updating config,
+	// then check the proxygroup reconciler doesn't overwrite it.
+	cfg.APIServerProxy.ServiceName = ptr.To(tailcfg.ServiceName("svc:some-svc-name"))
+	cfg.AdvertiseServices = []string{"svc:should-not-be-overwritten"}
+	cfgB, err = json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("failed to marshal config: %v", err)
+	}
+	mustUpdate(t, fc, tsNamespace, cfgSecret.Name, func(s *corev1.Secret) {
+		s.Data[kubetypes.KubeAPIServerConfigFile] = cfgB
+	})
+	expectReconciled(t, reconciler, "", pg.Name)
+
+	cfgSecret.Data[kubetypes.KubeAPIServerConfigFile] = cfgB
+	expectEqual(t, fc, cfgSecret)
 }
 
 func TestIngressAdvertiseServicesConfigPreserved(t *testing.T) {
@@ -1206,12 +1424,12 @@ func TestIngressAdvertiseServicesConfigPreserved(t *testing.T) {
 		WithStatusSubresource(&tsapi.ProxyGroup{}).
 		Build()
 	reconciler := &ProxyGroupReconciler{
-		tsNamespace: tsNamespace,
-		proxyImage:  testProxyImage,
-		Client:      fc,
-		l:           zap.Must(zap.NewDevelopment()).Sugar(),
-		tsClient:    &fakeTSClient{},
-		clock:       tstest.NewClock(tstest.ClockOpts{}),
+		tsNamespace:  tsNamespace,
+		tsProxyImage: testProxyImage,
+		Client:       fc,
+		l:            zap.Must(zap.NewDevelopment()).Sugar(),
+		tsClient:     &fakeTSClient{},
+		clock:        tstest.NewClock(tstest.ClockOpts{}),
 	}
 
 	existingServices := []string{"svc1", "svc2"}
@@ -1272,6 +1490,170 @@ func TestIngressAdvertiseServicesConfigPreserved(t *testing.T) {
 	})
 }
 
+func TestValidateProxyGroup(t *testing.T) {
+	type testCase struct {
+		typ            tsapi.ProxyGroupType
+		pgName         string
+		image          string
+		noauth         bool
+		initContainer  bool
+		staticSAExists bool
+		expectedErrs   int
+	}
+
+	for name, tc := range map[string]testCase{
+		"default_ingress": {
+			typ: tsapi.ProxyGroupTypeIngress,
+		},
+		"default_kube": {
+			typ:            tsapi.ProxyGroupTypeKubernetesAPIServer,
+			staticSAExists: true,
+		},
+		"default_kube_noauth": {
+			typ:    tsapi.ProxyGroupTypeKubernetesAPIServer,
+			noauth: true,
+			// Does not require the static ServiceAccount to exist.
+		},
+		"kube_static_sa_missing": {
+			typ:            tsapi.ProxyGroupTypeKubernetesAPIServer,
+			staticSAExists: false,
+			expectedErrs:   1,
+		},
+		"kube_noauth_would_overwrite_static_sa": {
+			typ:            tsapi.ProxyGroupTypeKubernetesAPIServer,
+			staticSAExists: true,
+			noauth:         true,
+			pgName:         authAPIServerProxySAName,
+			expectedErrs:   1,
+		},
+		"ingress_would_overwrite_static_sa": {
+			typ:            tsapi.ProxyGroupTypeIngress,
+			staticSAExists: true,
+			pgName:         authAPIServerProxySAName,
+			expectedErrs:   1,
+		},
+		"tailscale_image_for_kube_pg_1": {
+			typ:            tsapi.ProxyGroupTypeKubernetesAPIServer,
+			staticSAExists: true,
+			image:          "example.com/tailscale/tailscale",
+			expectedErrs:   1,
+		},
+		"tailscale_image_for_kube_pg_2": {
+			typ:            tsapi.ProxyGroupTypeKubernetesAPIServer,
+			staticSAExists: true,
+			image:          "example.com/tailscale",
+			expectedErrs:   1,
+		},
+		"tailscale_image_for_kube_pg_3": {
+			typ:            tsapi.ProxyGroupTypeKubernetesAPIServer,
+			staticSAExists: true,
+			image:          "example.com/tailscale/tailscale:latest",
+			expectedErrs:   1,
+		},
+		"tailscale_image_for_kube_pg_4": {
+			typ:            tsapi.ProxyGroupTypeKubernetesAPIServer,
+			staticSAExists: true,
+			image:          "tailscale/tailscale",
+			expectedErrs:   1,
+		},
+		"k8s_proxy_image_for_ingress_pg": {
+			typ:          tsapi.ProxyGroupTypeIngress,
+			image:        "example.com/k8s-proxy",
+			expectedErrs: 1,
+		},
+		"init_container_for_kube_pg": {
+			typ:            tsapi.ProxyGroupTypeKubernetesAPIServer,
+			staticSAExists: true,
+			initContainer:  true,
+			expectedErrs:   1,
+		},
+		"init_container_for_ingress_pg": {
+			typ:           tsapi.ProxyGroupTypeIngress,
+			initContainer: true,
+		},
+		"init_container_for_egress_pg": {
+			typ:           tsapi.ProxyGroupTypeEgress,
+			initContainer: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			pc := &tsapi.ProxyClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "some-pc",
+				},
+				Spec: tsapi.ProxyClassSpec{
+					StatefulSet: &tsapi.StatefulSet{
+						Pod: &tsapi.Pod{},
+					},
+				},
+			}
+			if tc.image != "" {
+				pc.Spec.StatefulSet.Pod.TailscaleContainer = &tsapi.Container{
+					Image: tc.image,
+				}
+			}
+			if tc.initContainer {
+				pc.Spec.StatefulSet.Pod.TailscaleInitContainer = &tsapi.Container{}
+			}
+			pgName := "some-pg"
+			if tc.pgName != "" {
+				pgName = tc.pgName
+			}
+			pg := &tsapi.ProxyGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: pgName,
+				},
+				Spec: tsapi.ProxyGroupSpec{
+					Type: tc.typ,
+				},
+			}
+			if tc.noauth {
+				pg.Spec.KubeAPIServer = &tsapi.KubeAPIServerConfig{
+					Mode: ptr.To(tsapi.APIServerProxyModeNoAuth),
+				}
+			}
+
+			var objs []client.Object
+			if tc.staticSAExists {
+				objs = append(objs, &corev1.ServiceAccount{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      authAPIServerProxySAName,
+						Namespace: tsNamespace,
+					},
+				})
+			}
+			r := ProxyGroupReconciler{
+				tsNamespace: tsNamespace,
+				Client: fake.NewClientBuilder().
+					WithObjects(objs...).
+					Build(),
+			}
+
+			logger, _ := zap.NewDevelopment()
+			err := r.validate(t.Context(), pg, pc, logger.Sugar())
+			if tc.expectedErrs == 0 {
+				if err != nil {
+					t.Fatalf("expected no errors, got: %v", err)
+				}
+				// Test finished.
+				return
+			}
+
+			if err == nil {
+				t.Fatalf("expected %d errors, got none", tc.expectedErrs)
+			}
+
+			type unwrapper interface {
+				Unwrap() []error
+			}
+			errs := err.(unwrapper)
+			if len(errs.Unwrap()) != tc.expectedErrs {
+				t.Fatalf("expected %d errors, got %d: %v", tc.expectedErrs, len(errs.Unwrap()), err)
+			}
+		})
+	}
+}
+
 func proxyClassesForLEStagingTest() (*tsapi.ProxyClass, *tsapi.ProxyClass, *tsapi.ProxyClass) {
 	pcLEStaging := &tsapi.ProxyClass{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1326,13 +1708,16 @@ func setProxyClassReady(t *testing.T, fc client.Client, cl *tstest.Clock, name s
 	return pc
 }
 
-func verifyProxyGroupCounts(t *testing.T, r *ProxyGroupReconciler, wantIngress, wantEgress int) {
+func verifyProxyGroupCounts(t *testing.T, r *ProxyGroupReconciler, wantIngress, wantEgress, wantAPIServer int) {
 	t.Helper()
 	if r.ingressProxyGroups.Len() != wantIngress {
 		t.Errorf("expected %d ingress proxy groups, got %d", wantIngress, r.ingressProxyGroups.Len())
 	}
 	if r.egressProxyGroups.Len() != wantEgress {
 		t.Errorf("expected %d egress proxy groups, got %d", wantEgress, r.egressProxyGroups.Len())
+	}
+	if r.apiServerProxyGroups.Len() != wantAPIServer {
+		t.Errorf("expected %d kube-apiserver proxy groups, got %d", wantAPIServer, r.apiServerProxyGroups.Len())
 	}
 }
 
@@ -1437,7 +1822,7 @@ func addNodeIDToStateSecrets(t *testing.T, fc client.WithWatch, pg *tsapi.ProxyG
 		if _, err := createOrUpdate(t.Context(), fc, "tailscale", pod, nil); err != nil {
 			t.Fatalf("failed to create or update Pod %s: %v", pod.Name, err)
 		}
-		mustUpdate(t, fc, tsNamespace, fmt.Sprintf("test-%d", i), func(s *corev1.Secret) {
+		mustUpdate(t, fc, tsNamespace, pgStateSecretName(pg.Name, i), func(s *corev1.Secret) {
 			s.Data = map[string][]byte{
 				currentProfileKey:       []byte(key),
 				key:                     bytes,
@@ -1512,7 +1897,7 @@ func TestProxyGroupLetsEncryptStaging(t *testing.T) {
 
 			reconciler := &ProxyGroupReconciler{
 				tsNamespace:       tsNamespace,
-				proxyImage:        testProxyImage,
+				tsProxyImage:      testProxyImage,
 				defaultTags:       []string{"tag:test"},
 				defaultProxyClass: tt.defaultProxyClass,
 				Client:            fc,

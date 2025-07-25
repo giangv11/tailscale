@@ -6,22 +6,24 @@
 package apiproxy
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
-	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/netip"
 	"net/url"
-	"os"
 	"strings"
+	"time"
 
-	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/k8s-operator/sessionrecording"
 	ksr "tailscale.com/k8s-operator/sessionrecording"
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/tailcfg"
@@ -37,123 +39,54 @@ var (
 	whoIsKey                  = ctxkey.New("", (*apitype.WhoIsResponse)(nil))
 )
 
-type APIServerProxyMode int
-
-func (a APIServerProxyMode) String() string {
-	switch a {
-	case APIServerProxyModeDisabled:
-		return "disabled"
-	case APIServerProxyModeEnabled:
-		return "auth"
-	case APIServerProxyModeNoAuth:
-		return "noauth"
-	default:
-		return "unknown"
-	}
-}
-
-const (
-	APIServerProxyModeDisabled APIServerProxyMode = iota
-	APIServerProxyModeEnabled
-	APIServerProxyModeNoAuth
-)
-
-func ParseAPIProxyMode() APIServerProxyMode {
-	haveAuthProxyEnv := os.Getenv("AUTH_PROXY") != ""
-	haveAPIProxyEnv := os.Getenv("APISERVER_PROXY") != ""
-	switch {
-	case haveAPIProxyEnv && haveAuthProxyEnv:
-		log.Fatal("AUTH_PROXY and APISERVER_PROXY are mutually exclusive")
-	case haveAuthProxyEnv:
-		var authProxyEnv = defaultBool("AUTH_PROXY", false) // deprecated
-		if authProxyEnv {
-			return APIServerProxyModeEnabled
-		}
-		return APIServerProxyModeDisabled
-	case haveAPIProxyEnv:
-		var apiProxyEnv = defaultEnv("APISERVER_PROXY", "") // true, false or "noauth"
-		switch apiProxyEnv {
-		case "true":
-			return APIServerProxyModeEnabled
-		case "false", "":
-			return APIServerProxyModeDisabled
-		case "noauth":
-			return APIServerProxyModeNoAuth
-		default:
-			panic(fmt.Sprintf("unknown APISERVER_PROXY value %q", apiProxyEnv))
-		}
-	}
-	return APIServerProxyModeDisabled
-}
-
-// maybeLaunchAPIServerProxy launches the auth proxy, which is a small HTTP server
-// that authenticates requests using the Tailscale LocalAPI and then proxies
-// them to the kube-apiserver.
-func MaybeLaunchAPIServerProxy(zlog *zap.SugaredLogger, restConfig *rest.Config, s *tsnet.Server, mode APIServerProxyMode) {
-	if mode == APIServerProxyModeDisabled {
-		return
-	}
-	startlog := zlog.Named("launchAPIProxy")
-	if mode == APIServerProxyModeNoAuth {
+// NewAPIServerProxy creates a new APIServerProxy that's ready to start once Run
+// is called. No network traffic will flow until Run is called.
+//
+// authMode controls how the proxy behaves:
+//   - true: the proxy is started and requests are impersonated using the
+//     caller's Tailscale identity and the rules defined in the tailnet ACLs.
+//   - false: the proxy is started and requests are passed through to the
+//     Kubernetes API without any auth modifications.
+func NewAPIServerProxy(zlog *zap.SugaredLogger, restConfig *rest.Config, ts *tsnet.Server, mode kubetypes.APIServerProxyMode, https bool) (*APIServerProxy, error) {
+	if mode == kubetypes.APIServerProxyModeNoAuth {
 		restConfig = rest.AnonymousClientConfig(restConfig)
 	}
+
 	cfg, err := restConfig.TransportConfig()
 	if err != nil {
-		startlog.Fatalf("could not get rest.TransportConfig(): %v", err)
+		return nil, fmt.Errorf("could not get rest.TransportConfig(): %w", err)
 	}
 
-	// Kubernetes uses SPDY for exec and port-forward, however SPDY is
-	// incompatible with HTTP/2; so disable HTTP/2 in the proxy.
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.TLSClientConfig, err = transport.TLSConfigFor(cfg)
 	if err != nil {
-		startlog.Fatalf("could not get transport.TLSConfigFor(): %v", err)
+		return nil, fmt.Errorf("could not get transport.TLSConfigFor(): %w", err)
 	}
 	tr.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
 
 	rt, err := transport.HTTPWrappersForConfig(cfg, tr)
 	if err != nil {
-		startlog.Fatalf("could not get rest.TransportConfig(): %v", err)
+		return nil, fmt.Errorf("could not get rest.TransportConfig(): %w", err)
 	}
-	go runAPIServerProxy(s, rt, zlog.Named("apiserver-proxy"), mode, restConfig.Host)
-}
 
-// runAPIServerProxy runs an HTTP server that authenticates requests using the
-// Tailscale LocalAPI and then proxies them to the Kubernetes API.
-// It listens on :443 and uses the Tailscale HTTPS certificate.
-// s will be started if it is not already running.
-// rt is used to proxy requests to the Kubernetes API.
-//
-// mode controls how the proxy behaves:
-//   - apiserverProxyModeDisabled: the proxy is not started.
-//   - apiserverProxyModeEnabled: the proxy is started and requests are impersonated using the
-//     caller's identity from the Tailscale LocalAPI.
-//   - apiserverProxyModeNoAuth: the proxy is started and requests are not impersonated and
-//     are passed through to the Kubernetes API.
-//
-// It never returns.
-func runAPIServerProxy(ts *tsnet.Server, rt http.RoundTripper, log *zap.SugaredLogger, mode APIServerProxyMode, host string) {
-	if mode == APIServerProxyModeDisabled {
-		return
-	}
-	ln, err := ts.Listen("tcp", ":443")
+	u, err := url.Parse(restConfig.Host)
 	if err != nil {
-		log.Fatalf("could not listen on :443: %v", err)
+		return nil, fmt.Errorf("failed to parse URL %w", err)
 	}
-	u, err := url.Parse(host)
-	if err != nil {
-		log.Fatalf("runAPIServerProxy: failed to parse URL %v", err)
+	if u.Scheme == "" || u.Host == "" {
+		return nil, fmt.Errorf("the API server proxy requires host and scheme but got: %q", restConfig.Host)
 	}
 
 	lc, err := ts.LocalClient()
 	if err != nil {
-		log.Fatalf("could not get local client: %v", err)
+		return nil, fmt.Errorf("could not get local client: %w", err)
 	}
 
-	ap := &apiserverProxy{
-		log:         log,
+	ap := &APIServerProxy{
+		log:         zlog,
 		lc:          lc,
-		mode:        mode,
+		authMode:    mode == kubetypes.APIServerProxyModeAuth,
+		https:       https,
 		upstreamURL: u,
 		ts:          ts,
 	}
@@ -164,41 +97,96 @@ func runAPIServerProxy(ts *tsnet.Server, rt http.RoundTripper, log *zap.SugaredL
 		Transport: rt,
 	}
 
+	return ap, nil
+}
+
+// Run starts the HTTP server that authenticates requests using the
+// Tailscale LocalAPI and then proxies them to the Kubernetes API.
+// It listens on :443 and uses the Tailscale HTTPS certificate.
+//
+// It return when ctx is cancelled or ServeTLS fails.
+func (ap *APIServerProxy) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", ap.serveDefault)
 	mux.HandleFunc("POST /api/v1/namespaces/{namespace}/pods/{pod}/exec", ap.serveExecSPDY)
 	mux.HandleFunc("GET /api/v1/namespaces/{namespace}/pods/{pod}/exec", ap.serveExecWS)
+	mux.HandleFunc("POST /api/v1/namespaces/{namespace}/pods/{pod}/attach", ap.serveAttachSPDY)
+	mux.HandleFunc("GET /api/v1/namespaces/{namespace}/pods/{pod}/attach", ap.serveAttachWS)
 
-	hs := &http.Server{
+	ap.hs = &http.Server{
+		Handler:  mux,
+		ErrorLog: zap.NewStdLog(ap.log.Desugar()),
+	}
+
+	mode := "noauth"
+	if ap.authMode {
+		mode = "auth"
+	}
+	var tsLn net.Listener
+	var serve func(ln net.Listener) error
+	if ap.https {
+		var err error
+		tsLn, err = ap.ts.Listen("tcp", ":443")
+		if err != nil {
+			return fmt.Errorf("could not listen on :443: %w", err)
+		}
+		serve = func(ln net.Listener) error {
+			return ap.hs.ServeTLS(ln, "", "")
+		}
+
 		// Kubernetes uses SPDY for exec and port-forward, however SPDY is
 		// incompatible with HTTP/2; so disable HTTP/2 in the proxy.
-		TLSConfig: &tls.Config{
-			GetCertificate: lc.GetCertificate,
+		ap.hs.TLSConfig = &tls.Config{
+			GetCertificate: ap.lc.GetCertificate,
 			NextProtos:     []string{"http/1.1"},
-		},
-		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
-		Handler:      mux,
+		}
+		ap.hs.TLSNextProto = make(map[string]func(*http.Server, *tls.Conn, http.Handler))
+	} else {
+		var err error
+		tsLn, err = ap.ts.Listen("tcp", ":80")
+		if err != nil {
+			return fmt.Errorf("could not listen on :80: %w", err)
+		}
+		serve = ap.hs.Serve
 	}
-	log.Infof("API server proxy in %q mode is listening on %s", mode, ln.Addr())
-	if err := hs.ServeTLS(ln, "", ""); err != nil {
-		log.Fatalf("runAPIServerProxy: failed to serve %v", err)
+
+	errs := make(chan error)
+	go func() {
+		ap.log.Infof("API server proxy in %s mode is listening on tailnet addresses %s", mode, tsLn.Addr())
+		if err := serve(tsLn); err != nil && err != http.ErrServerClosed {
+			errs <- fmt.Errorf("error serving: %w", err)
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+	case err := <-errs:
+		ap.hs.Close()
+		return err
 	}
+
+	// Graceful shutdown with a timeout of 10s.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return ap.hs.Shutdown(shutdownCtx)
 }
 
-// apiserverProxy is an [net/http.Handler] that authenticates requests using the Tailscale
+// APIServerProxy is an [net/http.Handler] that authenticates requests using the Tailscale
 // LocalAPI and then proxies them to the Kubernetes API.
-type apiserverProxy struct {
+type APIServerProxy struct {
 	log *zap.SugaredLogger
 	lc  *local.Client
 	rp  *httputil.ReverseProxy
 
-	mode        APIServerProxyMode
+	authMode    bool // Whether to run with impersonation using caller's tailnet identity.
+	https       bool // Whether to serve on https for the device hostname; true for k8s-operator, false for k8s-proxy.
 	ts          *tsnet.Server
+	hs          *http.Server
 	upstreamURL *url.URL
 }
 
 // serveDefault is the default handler for Kubernetes API server requests.
-func (ap *apiserverProxy) serveDefault(w http.ResponseWriter, r *http.Request) {
+func (ap *APIServerProxy) serveDefault(w http.ResponseWriter, r *http.Request) {
 	who, err := ap.whoIs(r)
 	if err != nil {
 		ap.authError(w, err)
@@ -208,19 +196,31 @@ func (ap *apiserverProxy) serveDefault(w http.ResponseWriter, r *http.Request) {
 	ap.rp.ServeHTTP(w, r.WithContext(whoIsKey.WithValue(r.Context(), who)))
 }
 
-// serveExecSPDY serves 'kubectl exec' requests for sessions streamed over SPDY,
+// serveExecSPDY serves '/exec' requests for sessions streamed over SPDY,
 // optionally configuring the kubectl exec sessions to be recorded.
-func (ap *apiserverProxy) serveExecSPDY(w http.ResponseWriter, r *http.Request) {
-	ap.execForProto(w, r, ksr.SPDYProtocol)
+func (ap *APIServerProxy) serveExecSPDY(w http.ResponseWriter, r *http.Request) {
+	ap.sessionForProto(w, r, ksr.ExecSessionType, ksr.SPDYProtocol)
 }
 
-// serveExecWS serves 'kubectl exec' requests for sessions streamed over WebSocket,
+// serveExecWS serves '/exec' requests for sessions streamed over WebSocket,
 // optionally configuring the kubectl exec sessions to be recorded.
-func (ap *apiserverProxy) serveExecWS(w http.ResponseWriter, r *http.Request) {
-	ap.execForProto(w, r, ksr.WSProtocol)
+func (ap *APIServerProxy) serveExecWS(w http.ResponseWriter, r *http.Request) {
+	ap.sessionForProto(w, r, ksr.ExecSessionType, ksr.WSProtocol)
 }
 
-func (ap *apiserverProxy) execForProto(w http.ResponseWriter, r *http.Request, proto ksr.Protocol) {
+// serveAttachSPDY serves '/attach' requests for sessions streamed over SPDY,
+// optionally configuring the kubectl exec sessions to be recorded.
+func (ap *APIServerProxy) serveAttachSPDY(w http.ResponseWriter, r *http.Request) {
+	ap.sessionForProto(w, r, ksr.AttachSessionType, ksr.SPDYProtocol)
+}
+
+// serveAttachWS serves '/attach' requests for sessions streamed over WebSocket,
+// optionally configuring the kubectl exec sessions to be recorded.
+func (ap *APIServerProxy) serveAttachWS(w http.ResponseWriter, r *http.Request) {
+	ap.sessionForProto(w, r, ksr.AttachSessionType, ksr.WSProtocol)
+}
+
+func (ap *APIServerProxy) sessionForProto(w http.ResponseWriter, r *http.Request, sessionType sessionrecording.SessionType, proto ksr.Protocol) {
 	const (
 		podNameKey       = "pod"
 		namespaceNameKey = "namespace"
@@ -235,7 +235,7 @@ func (ap *apiserverProxy) execForProto(w http.ResponseWriter, r *http.Request, p
 	counterNumRequestsProxied.Add(1)
 	failOpen, addrs, err := determineRecorderConfig(who)
 	if err != nil {
-		ap.log.Errorf("error trying to determine whether the 'kubectl exec' session needs to be recorded: %v", err)
+		ap.log.Errorf("error trying to determine whether the 'kubectl %s' session needs to be recorded: %v", sessionType, err)
 		return
 	}
 	if failOpen && len(addrs) == 0 { // will not record
@@ -244,7 +244,7 @@ func (ap *apiserverProxy) execForProto(w http.ResponseWriter, r *http.Request, p
 	}
 	ksr.CounterSessionRecordingsAttempted.Add(1) // at this point we know that users intended for this session to be recorded
 	if !failOpen && len(addrs) == 0 {
-		msg := "forbidden: 'kubectl exec' session must be recorded, but no recorders are available."
+		msg := fmt.Sprintf("forbidden: 'kubectl %s' session must be recorded, but no recorders are available.", sessionType)
 		ap.log.Error(msg)
 		http.Error(w, msg, http.StatusForbidden)
 		return
@@ -266,26 +266,27 @@ func (ap *apiserverProxy) execForProto(w http.ResponseWriter, r *http.Request, p
 	}
 
 	opts := ksr.HijackerOpts{
-		Req:       r,
-		W:         w,
-		Proto:     proto,
-		TS:        ap.ts,
-		Who:       who,
-		Addrs:     addrs,
-		FailOpen:  failOpen,
-		Pod:       r.PathValue(podNameKey),
-		Namespace: r.PathValue(namespaceNameKey),
-		Log:       ap.log,
+		Req:         r,
+		W:           w,
+		Proto:       proto,
+		SessionType: sessionType,
+		TS:          ap.ts,
+		Who:         who,
+		Addrs:       addrs,
+		FailOpen:    failOpen,
+		Pod:         r.PathValue(podNameKey),
+		Namespace:   r.PathValue(namespaceNameKey),
+		Log:         ap.log,
 	}
-	h := ksr.New(opts)
+	h := ksr.NewHijacker(opts)
 
 	ap.rp.ServeHTTP(h, r.WithContext(whoIsKey.WithValue(r.Context(), who)))
 }
 
-func (h *apiserverProxy) addImpersonationHeadersAsRequired(r *http.Request) {
-	r.URL.Scheme = h.upstreamURL.Scheme
-	r.URL.Host = h.upstreamURL.Host
-	if h.mode == APIServerProxyModeNoAuth {
+func (ap *APIServerProxy) addImpersonationHeadersAsRequired(r *http.Request) {
+	r.URL.Scheme = ap.upstreamURL.Scheme
+	r.URL.Host = ap.upstreamURL.Host
+	if !ap.authMode {
 		// If we are not providing authentication, then we are just
 		// proxying to the Kubernetes API, so we don't need to do
 		// anything else.
@@ -310,16 +311,16 @@ func (h *apiserverProxy) addImpersonationHeadersAsRequired(r *http.Request) {
 	}
 
 	// Now add the impersonation headers that we want.
-	if err := addImpersonationHeaders(r, h.log); err != nil {
-		log.Print("failed to add impersonation headers: ", err.Error())
+	if err := addImpersonationHeaders(r, ap.log); err != nil {
+		ap.log.Errorf("failed to add impersonation headers: %v", err)
 	}
 }
 
-func (ap *apiserverProxy) whoIs(r *http.Request) (*apitype.WhoIsResponse, error) {
+func (ap *APIServerProxy) whoIs(r *http.Request) (*apitype.WhoIsResponse, error) {
 	return ap.lc.WhoIs(r.Context(), r.RemoteAddr)
 }
 
-func (ap *apiserverProxy) authError(w http.ResponseWriter, err error) {
+func (ap *APIServerProxy) authError(w http.ResponseWriter, err error) {
 	ap.log.Errorf("failed to authenticate caller: %v", err)
 	http.Error(w, "failed to authenticate caller", http.StatusInternalServerError)
 }

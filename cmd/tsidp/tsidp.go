@@ -39,6 +39,7 @@ import (
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/envknob"
+	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
@@ -121,6 +122,7 @@ func main() {
 		}
 		defer cleanup()
 	} else {
+		hostinfo.SetApp("tsidp")
 		ts := &tsnet.Server{
 			Hostname: *flagHostname,
 			Dir:      *flagDir,
@@ -268,7 +270,7 @@ func serveOnLocalTailscaled(ctx context.Context, lc *local.Client, st *ipnstate.
 	foregroundSc.SetFunnel(serverURL, dstPort, shouldFunnel)
 	foregroundSc.SetWebHandler(&ipn.HTTPHandler{
 		Proxy: fmt.Sprintf("https://%s", net.JoinHostPort(serverURL, strconv.Itoa(int(dstPort)))),
-	}, serverURL, uint16(*flagPort), "/", true)
+	}, serverURL, uint16(*flagPort), "/", true, st.CurrentTailnet.MagicDNSSuffix)
 	err = lc.SetServeConfig(ctx, sc)
 	if err != nil {
 		return nil, watcherChan, fmt.Errorf("could not set serve config: %v", err)

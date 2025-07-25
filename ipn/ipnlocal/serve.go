@@ -1007,8 +1007,6 @@ func allNumeric(s string) bool {
 }
 
 func (b *LocalBackend) webServerConfig(hostname string, forVIPService tailcfg.ServiceName, port uint16) (c ipn.WebServerConfigView, ok bool) {
-	key := ipn.HostPort(fmt.Sprintf("%s:%v", hostname, port))
-
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -1016,8 +1014,12 @@ func (b *LocalBackend) webServerConfig(hostname string, forVIPService tailcfg.Se
 		return c, false
 	}
 	if forVIPService != "" {
+		magicDNSSuffix := b.currentNode().NetMap().MagicDNSSuffix()
+		fqdn := strings.Join([]string{forVIPService.WithoutPrefix(), magicDNSSuffix}, ".")
+		key := ipn.HostPort(net.JoinHostPort(fqdn, fmt.Sprintf("%d", port)))
 		return b.serveConfig.FindServiceWeb(forVIPService, key)
 	}
+	key := ipn.HostPort(net.JoinHostPort(hostname, fmt.Sprintf("%d", port)))
 	return b.serveConfig.FindWeb(key)
 }
 

@@ -859,6 +859,7 @@ type fakeLocalServeClient struct {
 	config               *ipn.ServeConfig
 	setCount             int                       // counts calls to SetServeConfig
 	queryFeatureResponse *mockQueryFeatureResponse // mock response to QueryFeature calls
+	prefs                *ipn.Prefs                // fake preferences, used to test GetPrefs and SetPrefs
 }
 
 // fakeStatus is a fake ipnstate.Status value for tests.
@@ -875,6 +876,7 @@ var fakeStatus = &ipnstate.Status{
 			tailcfg.CapabilityFunnelPorts + "?ports=443,8443": nil,
 		},
 	},
+	CurrentTailnet: &ipnstate.TailnetStatus{MagicDNSSuffix: "test.ts.net"},
 }
 
 func (lc *fakeLocalServeClient) StatusWithoutPeers(ctx context.Context) (*ipnstate.Status, error) {
@@ -889,6 +891,21 @@ func (lc *fakeLocalServeClient) SetServeConfig(ctx context.Context, config *ipn.
 	lc.setCount += 1
 	lc.config = config.Clone()
 	return nil
+}
+
+func (lc *fakeLocalServeClient) GetPrefs(ctx context.Context) (*ipn.Prefs, error) {
+	if lc.prefs == nil {
+		lc.prefs = ipn.NewPrefs()
+	}
+	return lc.prefs, nil
+}
+
+func (lc *fakeLocalServeClient) EditPrefs(ctx context.Context, prefs *ipn.MaskedPrefs) (*ipn.Prefs, error) {
+	if lc.prefs == nil {
+		lc.prefs = ipn.NewPrefs()
+	}
+	lc.prefs.ApplyEdits(prefs)
+	return lc.prefs, nil
 }
 
 type mockQueryFeatureResponse struct {

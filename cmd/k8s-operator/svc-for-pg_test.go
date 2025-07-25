@@ -26,6 +26,7 @@ import (
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/kube/ingressservices"
+	"tailscale.com/kube/kubetypes"
 	"tailscale.com/tstest"
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/mak"
@@ -139,7 +140,7 @@ func setupServiceTest(t *testing.T) (*HAServiceReconciler, *corev1.Secret, clien
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      pgConfigSecretName("test-pg", 0),
 			Namespace: "operator-ns",
-			Labels:    pgSecretLabels("test-pg", "config"),
+			Labels:    pgSecretLabels("test-pg", kubetypes.LabelSecretTypeConfig),
 		},
 		Data: map[string][]byte{
 			tsoperator.TailscaledConfigFileName(pgMinCapabilityVersion): []byte(`{"Version":""}`),
@@ -187,7 +188,6 @@ func setupServiceTest(t *testing.T) (*HAServiceReconciler, *corev1.Secret, clien
 	if err := fc.Status().Update(context.Background(), pg); err != nil {
 		t.Fatal(err)
 	}
-	fakeTsnetServer := &fakeTSNetServer{certDomains: []string{"foo.com"}}
 
 	ft := &fakeTSClient{}
 	zl, err := zap.NewDevelopment()
@@ -210,7 +210,6 @@ func setupServiceTest(t *testing.T) (*HAServiceReconciler, *corev1.Secret, clien
 		clock:       cl,
 		defaultTags: []string{"tag:k8s"},
 		tsNamespace: "operator-ns",
-		tsnetServer: fakeTsnetServer,
 		logger:      zl.Sugar(),
 		recorder:    record.NewFakeRecorder(10),
 		lc:          lc,
@@ -300,12 +299,12 @@ func TestServicePGReconciler_MultiCluster(t *testing.T) {
 			t.Fatalf("getting Tailscale Service: %v", err)
 		}
 
-		if len(tsSvcs) != 1 {
-			t.Fatalf("unexpected number of Tailscale Services (%d)", len(tsSvcs))
+		if len(tsSvcs.VIPServices) != 1 {
+			t.Fatalf("unexpected number of Tailscale Services (%d)", len(tsSvcs.VIPServices))
 		}
 
-		for name := range tsSvcs {
-			t.Logf("found Tailscale Service with name %q", name.String())
+		for _, svc := range tsSvcs.VIPServices {
+			t.Logf("found Tailscale Service with name %q", svc.Name)
 		}
 	}
 }
@@ -338,7 +337,7 @@ func TestIgnoreRegularService(t *testing.T) {
 
 	tsSvcs, err := ft.ListVIPServices(context.Background())
 	if err == nil {
-		if len(tsSvcs) > 0 {
+		if len(tsSvcs.VIPServices) > 0 {
 			t.Fatal("unexpected Tailscale Services found")
 		}
 	}

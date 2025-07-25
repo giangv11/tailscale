@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 
 	"tailscale.com/types/lazy"
 	"tailscale.com/util/lineiter"
@@ -31,6 +32,7 @@ const (
 	Unraid    = Distro("unraid")
 	Alpine    = Distro("alpine")
 	UBNT      = Distro("ubnt") // Ubiquiti Networks
+	JetKVM    = Distro("jetkvm")
 )
 
 var distro lazy.SyncValue[Distro]
@@ -102,8 +104,18 @@ func linuxDistro() Distro {
 		return Unraid
 	case have("/etc/alpine-release"):
 		return Alpine
+	case runtime.GOARCH == "arm" && isDeviceModel("JetKVM"):
+		return JetKVM
 	}
 	return ""
+}
+
+func isDeviceModel(want string) bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	v, _ := os.ReadFile("/sys/firmware/devicetree/base/model")
+	return want == strings.Trim(string(v), "\x00\r\n\t ")
 }
 
 func freebsdDistro() Distro {

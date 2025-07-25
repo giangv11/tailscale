@@ -12,8 +12,10 @@ import (
 	"maps"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -73,8 +75,13 @@ func TestIngressPGReconciler(t *testing.T) {
 
 	// Verify that Role and RoleBinding have been created for the first Ingress.
 	// Do not verify the cert Secret as that was already verified implicitly above.
+	pg := &tsapi.ProxyGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-pg",
+		},
+	}
 	expectEqual(t, fc, certSecretRole("test-pg", "operator-ns", "my-svc.ts.net"))
-	expectEqual(t, fc, certSecretRoleBinding("test-pg", "operator-ns", "my-svc.ts.net"))
+	expectEqual(t, fc, certSecretRoleBinding(pg, "operator-ns", "my-svc.ts.net"))
 
 	mustUpdate(t, fc, "default", "test-ingress", func(ing *networkingv1.Ingress) {
 		ing.Annotations["tailscale.com/tags"] = "tag:custom,tag:test"
@@ -135,7 +142,7 @@ func TestIngressPGReconciler(t *testing.T) {
 	// Verify that Role and RoleBinding have been created for the second Ingress.
 	// Do not verify the cert Secret as that was already verified implicitly above.
 	expectEqual(t, fc, certSecretRole("test-pg", "operator-ns", "my-other-svc.ts.net"))
-	expectEqual(t, fc, certSecretRoleBinding("test-pg", "operator-ns", "my-other-svc.ts.net"))
+	expectEqual(t, fc, certSecretRoleBinding(pg, "operator-ns", "my-other-svc.ts.net"))
 
 	// Verify first Ingress is still working
 	verifyServeConfig(t, fc, "svc:my-svc", false)
@@ -184,7 +191,12 @@ func TestIngressPGReconciler(t *testing.T) {
 	})
 	expectReconciled(t, ingPGR, "default", "test-ingress")
 	expectEqual(t, fc, certSecretRole("test-pg-second", "operator-ns", "my-svc.ts.net"))
-	expectEqual(t, fc, certSecretRoleBinding("test-pg-second", "operator-ns", "my-svc.ts.net"))
+	pg = &tsapi.ProxyGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-pg-second",
+		},
+	}
+	expectEqual(t, fc, certSecretRoleBinding(pg, "operator-ns", "my-svc.ts.net"))
 
 	// Delete the first Ingress and verify cleanup
 	if err := fc.Delete(context.Background(), ing); err != nil {
@@ -521,7 +533,7 @@ func TestIngressPGReconciler_HTTPEndpoint(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-pg-0",
 			Namespace: "operator-ns",
-			Labels:    pgSecretLabels("test-pg", "state"),
+			Labels:    pgSecretLabels("test-pg", kubetypes.LabelSecretTypeState),
 		},
 		Data: map[string][]byte{
 			"_current-profile": []byte("profile-foo"),
@@ -658,6 +670,61 @@ func TestIngressPGReconciler_MultiCluster(t *testing.T) {
 	}
 }
 
+func TestOwnerAnnotations(t *testing.T) {
+	singleSelfOwner := map[string]string{
+		ownerAnnotation: `{"ownerRefs":[{"operatorID":"self-id"}]}`,
+	}
+
+	for name, tc := range map[string]struct {
+		svc             *tailscale.VIPService
+		wantAnnotations map[string]string
+		wantErr         string
+	}{
+		"no_svc": {
+			svc:             nil,
+			wantAnnotations: singleSelfOwner,
+		},
+		"empty_svc": {
+			svc:     &tailscale.VIPService{},
+			wantErr: "likely a resource created by something other than the Tailscale Kubernetes operator",
+		},
+		"already_owner": {
+			svc: &tailscale.VIPService{
+				Annotations: singleSelfOwner,
+			},
+			wantAnnotations: singleSelfOwner,
+		},
+		"add_owner": {
+			svc: &tailscale.VIPService{
+				Annotations: map[string]string{
+					ownerAnnotation: `{"ownerRefs":[{"operatorID":"operator-2"}]}`,
+				},
+			},
+			wantAnnotations: map[string]string{
+				ownerAnnotation: `{"ownerRefs":[{"operatorID":"operator-2"},{"operatorID":"self-id"}]}`,
+			},
+		},
+		"owned_by_proxygroup": {
+			svc: &tailscale.VIPService{
+				Annotations: map[string]string{
+					ownerAnnotation: `{"ownerRefs":[{"operatorID":"self-id","resource":{"kind":"ProxyGroup","name":"test-pg","uid":"1234-UID"}}]}`,
+				},
+			},
+			wantErr: "owned by another resource",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := ownerAnnotations("self-id", tc.svc)
+			if tc.wantErr != "" && !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("ownerAnnotations() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if diff := cmp.Diff(tc.wantAnnotations, got); diff != "" {
+				t.Errorf("ownerAnnotations() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func populateTLSSecret(ctx context.Context, c client.Client, pgName, domain string) error {
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -667,7 +734,7 @@ func populateTLSSecret(ctx context.Context, c client.Client, pgName, domain stri
 				kubetypes.LabelManaged:    "true",
 				labelProxyGroup:           pgName,
 				labelDomain:               domain,
-				kubetypes.LabelSecretType: "certs",
+				kubetypes.LabelSecretType: kubetypes.LabelSecretTypeCerts,
 			},
 		},
 		Type: corev1.SecretTypeTLS,
@@ -765,7 +832,7 @@ func verifyTailscaledConfig(t *testing.T, fc client.Client, pgName string, expec
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      pgConfigSecretName(pgName, 0),
 			Namespace: "operator-ns",
-			Labels:    pgSecretLabels(pgName, "config"),
+			Labels:    pgSecretLabels(pgName, kubetypes.LabelSecretTypeConfig),
 		},
 		Data: map[string][]byte{
 			tsoperator.TailscaledConfigFileName(pgMinCapabilityVersion): []byte(fmt.Sprintf(`{"Version":""%s}`, expected)),
@@ -804,7 +871,7 @@ func createPGResources(t *testing.T, fc client.Client, pgName string) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      pgConfigSecretName(pgName, 0),
 			Namespace: "operator-ns",
-			Labels:    pgSecretLabels(pgName, "config"),
+			Labels:    pgSecretLabels(pgName, kubetypes.LabelSecretTypeConfig),
 		},
 		Data: map[string][]byte{
 			tsoperator.TailscaledConfigFileName(pgMinCapabilityVersion): []byte("{}"),

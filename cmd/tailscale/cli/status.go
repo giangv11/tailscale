@@ -70,6 +70,8 @@ var statusArgs struct {
 	peers   bool   // in CLI mode, show status of peer machines
 }
 
+const mullvadTCD = "mullvad.ts.net."
+
 func runStatus(ctx context.Context, args []string) error {
 	if len(args) > 0 {
 		return errors.New("unexpected non-flag arguments to 'tailscale status'")
@@ -183,10 +185,12 @@ func runStatus(ctx context.Context, args []string) error {
 			} else if ps.ExitNodeOption {
 				f("offers exit node; ")
 			}
-			if relay != "" && ps.CurAddr == "" {
+			if relay != "" && ps.CurAddr == "" && ps.PeerRelay == "" {
 				f("relay %q", relay)
 			} else if ps.CurAddr != "" {
 				f("direct %s", ps.CurAddr)
+			} else if ps.PeerRelay != "" {
+				f("peer-relay %s", ps.PeerRelay)
 			}
 			if !ps.Online {
 				f("; offline")
@@ -210,9 +214,8 @@ func runStatus(ctx context.Context, args []string) error {
 			if ps.ShareeNode {
 				continue
 			}
-			if ps.Location != nil && ps.ExitNodeOption && !ps.ExitNode {
-				// Location based exit nodes are only shown with the
-				// `exit-node list` command.
+			if ps.ExitNodeOption && !ps.ExitNode && strings.HasSuffix(ps.DNSName, mullvadTCD) {
+				// Mullvad exit nodes are only shown with the `exit-node list` command.
 				locBasedExitNode = true
 				continue
 			}
@@ -260,7 +263,7 @@ func printFunnelStatus(ctx context.Context) {
 		}
 		sni, portStr, _ := net.SplitHostPort(string(hp))
 		p, _ := strconv.ParseUint(portStr, 10, 16)
-		isTCP := sc.IsTCPForwardingOnPort(uint16(p))
+		isTCP := sc.IsTCPForwardingOnPort(uint16(p), noService)
 		url := "https://"
 		if isTCP {
 			url = "tcp://"

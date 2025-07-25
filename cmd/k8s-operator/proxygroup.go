@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 
+	dockerref "github.com/distribution/reference"
 	"go.uber.org/zap"
 	xslices "golang.org/x/exp/slices"
 	appsv1 "k8s.io/api/apps/v1"
@@ -36,9 +37,11 @@ import (
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/kube/egressservices"
+	"tailscale.com/kube/k8s-proxy/conf"
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime"
+	"tailscale.com/types/opt"
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/mak"
@@ -48,7 +51,9 @@ import (
 const (
 	reasonProxyGroupCreationFailed = "ProxyGroupCreationFailed"
 	reasonProxyGroupReady          = "ProxyGroupReady"
+	reasonProxyGroupAvailable      = "ProxyGroupAvailable"
 	reasonProxyGroupCreating       = "ProxyGroupCreating"
+	reasonProxyGroupInvalid        = "ProxyGroupInvalid"
 
 	// Copied from k8s.io/apiserver/pkg/registry/generic/registry/store.go@cccad306d649184bf2a0e319ba830c53f65c445c
 	optimisticLockErrorMsg  = "the object has been modified; please apply your changes to the latest version and try again"
@@ -67,8 +72,9 @@ const (
 )
 
 var (
-	gaugeEgressProxyGroupResources  = clientmetric.NewGauge(kubetypes.MetricProxyGroupEgressCount)
-	gaugeIngressProxyGroupResources = clientmetric.NewGauge(kubetypes.MetricProxyGroupIngressCount)
+	gaugeEgressProxyGroupResources    = clientmetric.NewGauge(kubetypes.MetricProxyGroupEgressCount)
+	gaugeIngressProxyGroupResources   = clientmetric.NewGauge(kubetypes.MetricProxyGroupIngressCount)
+	gaugeAPIServerProxyGroupResources = clientmetric.NewGauge(kubetypes.MetricProxyGroupAPIServerCount)
 )
 
 // ProxyGroupReconciler ensures cluster resources for a ProxyGroup definition.
@@ -81,15 +87,17 @@ type ProxyGroupReconciler struct {
 
 	// User-specified defaults from the helm installation.
 	tsNamespace       string
-	proxyImage        string
+	tsProxyImage      string
+	k8sProxyImage     string
 	defaultTags       []string
 	tsFirewallMode    string
 	defaultProxyClass string
 	loginServer       string
 
-	mu                 sync.Mutex           // protects following
-	egressProxyGroups  set.Slice[types.UID] // for egress proxygroups gauge
-	ingressProxyGroups set.Slice[types.UID] // for ingress proxygroups gauge
+	mu                   sync.Mutex           // protects following
+	egressProxyGroups    set.Slice[types.UID] // for egress proxygroups gauge
+	ingressProxyGroups   set.Slice[types.UID] // for ingress proxygroups gauge
+	apiServerProxyGroups set.Slice[types.UID] // for kube-apiserver proxygroups gauge
 }
 
 func (r *ProxyGroupReconciler) logger(name string) *zap.SugaredLogger {
@@ -118,6 +126,10 @@ func (r *ProxyGroupReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 		}
 
 		if done, err := r.maybeCleanup(ctx, pg); err != nil {
+			if strings.Contains(err.Error(), optimisticLockErrorMsg) {
+				logger.Infof("optimistic lock error, retrying: %s", err)
+				return reconcile.Result{}, nil
+			}
 			return reconcile.Result{}, err
 		} else if !done {
 			logger.Debugf("ProxyGroup resource cleanup not yet finished, will retry...")
@@ -149,7 +161,7 @@ func (r *ProxyGroupReconciler) reconcilePG(ctx context.Context, pg *tsapi.ProxyG
 		logger.Infof("ensuring ProxyGroup is set up")
 		pg.Finalizers = append(pg.Finalizers, FinalizerName)
 		if err := r.Update(ctx, pg); err != nil {
-			return r.notReadyErrf(pg, "error adding finalizer: %w", err)
+			return r.notReadyErrf(pg, logger, "error adding finalizer: %w", err)
 		}
 	}
 
@@ -165,38 +177,31 @@ func (r *ProxyGroupReconciler) reconcilePG(ctx context.Context, pg *tsapi.ProxyG
 		if apierrors.IsNotFound(err) {
 			msg := fmt.Sprintf("the ProxyGroup's ProxyClass %q does not (yet) exist", proxyClassName)
 			logger.Info(msg)
-			return r.notReady(reasonProxyGroupCreating, msg)
+			return notReady(reasonProxyGroupCreating, msg)
 		}
 		if err != nil {
-			return r.notReadyErrf(pg, "error getting ProxyGroup's ProxyClass %q: %w", proxyClassName, err)
+			return r.notReadyErrf(pg, logger, "error getting ProxyGroup's ProxyClass %q: %w", proxyClassName, err)
 		}
-		validateProxyClassForPG(logger, pg, proxyClass)
 		if !tsoperator.ProxyClassIsReady(proxyClass) {
 			msg := fmt.Sprintf("the ProxyGroup's ProxyClass %q is not yet in a ready state, waiting...", proxyClassName)
 			logger.Info(msg)
-			return r.notReady(reasonProxyGroupCreating, msg)
+			return notReady(reasonProxyGroupCreating, msg)
 		}
+	}
+
+	if err := r.validate(ctx, pg, proxyClass, logger); err != nil {
+		return notReady(reasonProxyGroupInvalid, fmt.Sprintf("invalid ProxyGroup spec: %v", err))
 	}
 
 	staticEndpoints, nrr, err := r.maybeProvision(ctx, pg, proxyClass)
 	if err != nil {
-		if strings.Contains(err.Error(), optimisticLockErrorMsg) {
-			msg := fmt.Sprintf("optimistic lock error, retrying: %s", nrr.message)
-			logger.Info(msg)
-			return r.notReady(reasonProxyGroupCreating, msg)
-		} else {
-			return nil, nrr, err
-		}
+		return nil, nrr, err
 	}
 
 	return staticEndpoints, nrr, nil
 }
 
-// validateProxyClassForPG applies custom validation logic for ProxyClass applied to ProxyGroup.
-func validateProxyClassForPG(logger *zap.SugaredLogger, pg *tsapi.ProxyGroup, pc *tsapi.ProxyClass) {
-	if pg.Spec.Type == tsapi.ProxyGroupTypeIngress {
-		return
-	}
+func (r *ProxyGroupReconciler) validate(ctx context.Context, pg *tsapi.ProxyGroup, pc *tsapi.ProxyClass, logger *zap.SugaredLogger) error {
 	// Our custom logic for ensuring minimum downtime ProxyGroup update rollouts relies on the local health check
 	// beig accessible on the replica Pod IP:9002. This address can also be modified by users, via
 	// TS_LOCAL_ADDR_PORT env var.
@@ -208,13 +213,70 @@ func validateProxyClassForPG(logger *zap.SugaredLogger, pg *tsapi.ProxyGroup, pc
 	// shouldn't need to set their own).
 	//
 	// TODO(irbekrm): maybe disallow configuring this env var in future (in Tailscale 1.84 or later).
-	if hasLocalAddrPortSet(pc) {
+	if pg.Spec.Type == tsapi.ProxyGroupTypeEgress && hasLocalAddrPortSet(pc) {
 		msg := fmt.Sprintf("ProxyClass %s applied to an egress ProxyGroup has TS_LOCAL_ADDR_PORT env var set to a custom value."+
 			"This will disable the ProxyGroup graceful failover mechanism, so you might experience downtime when ProxyGroup pods are restarted."+
 			"In future we will remove the ability to set custom TS_LOCAL_ADDR_PORT for egress ProxyGroups."+
 			"Please raise an issue if you expect that this will cause issues for your workflow.", pc.Name)
 		logger.Warn(msg)
 	}
+
+	// image is the value of pc.Spec.StatefulSet.Pod.TailscaleContainer.Image or ""
+	// imagePath is a slash-delimited path ending with the image name, e.g.
+	// "tailscale/tailscale" or maybe "k8s-proxy" if hosted at example.com/k8s-proxy.
+	var image, imagePath string
+	if pc != nil &&
+		pc.Spec.StatefulSet != nil &&
+		pc.Spec.StatefulSet.Pod != nil &&
+		pc.Spec.StatefulSet.Pod.TailscaleContainer != nil &&
+		pc.Spec.StatefulSet.Pod.TailscaleContainer.Image != "" {
+		image, err := dockerref.ParseNormalizedNamed(pc.Spec.StatefulSet.Pod.TailscaleContainer.Image)
+		if err != nil {
+			// Shouldn't be possible as the ProxyClass won't be marked ready
+			// without successfully parsing the image.
+			return fmt.Errorf("error parsing %q as a container image reference: %w", pc.Spec.StatefulSet.Pod.TailscaleContainer.Image, err)
+		}
+		imagePath = dockerref.Path(image)
+	}
+
+	var errs []error
+	if isAuthAPIServerProxy(pg) {
+		// Validate that the static ServiceAccount already exists.
+		sa := &corev1.ServiceAccount{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: r.tsNamespace, Name: authAPIServerProxySAName}, sa); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return fmt.Errorf("error validating that ServiceAccount %q exists: %w", authAPIServerProxySAName, err)
+			}
+
+			errs = append(errs, fmt.Errorf("the ServiceAccount %q used for the API server proxy in auth mode does not exist but "+
+				"should have been created during operator installation; use apiServerProxyConfig.allowImpersonation=true "+
+				"in the helm chart, or authproxy-rbac.yaml from the static manifests", authAPIServerProxySAName))
+		}
+	} else {
+		// Validate that the ServiceAccount we create won't overwrite the static one.
+		// TODO(tomhjp): This doesn't cover other controllers that could create a
+		// ServiceAccount. Perhaps should have some guards to ensure that an update
+		// would never change the ownership of a resource we expect to already be owned.
+		if pgServiceAccountName(pg) == authAPIServerProxySAName {
+			errs = append(errs, fmt.Errorf("the name of the ProxyGroup %q conflicts with the static ServiceAccount used for the API server proxy in auth mode", pg.Name))
+		}
+	}
+
+	if pg.Spec.Type == tsapi.ProxyGroupTypeKubernetesAPIServer {
+		if strings.HasSuffix(imagePath, "tailscale") {
+			errs = append(errs, fmt.Errorf("the configured ProxyClass %q specifies to use image %q but expected a %q image for ProxyGroup of type %q", pc.Name, image, "k8s-proxy", pg.Spec.Type))
+		}
+
+		if pc != nil && pc.Spec.StatefulSet != nil && pc.Spec.StatefulSet.Pod != nil && pc.Spec.StatefulSet.Pod.TailscaleInitContainer != nil {
+			errs = append(errs, fmt.Errorf("the configured ProxyClass %q specifies Tailscale init container config, but ProxyGroups of type %q do not use init containers", pc.Name, pg.Spec.Type))
+		}
+	} else {
+		if strings.HasSuffix(imagePath, "k8s-proxy") {
+			errs = append(errs, fmt.Errorf("the configured ProxyClass %q specifies to use image %q but expected a %q image for ProxyGroup of type %q", pc.Name, image, "tailscale", pg.Spec.Type))
+		}
+	}
+
+	return errors.Join(errs...)
 }
 
 func (r *ProxyGroupReconciler) maybeProvision(ctx context.Context, pg *tsapi.ProxyGroup, proxyClass *tsapi.ProxyClass) (map[string][]netip.AddrPort, *notReadyReason, error) {
@@ -234,9 +296,9 @@ func (r *ProxyGroupReconciler) maybeProvision(ctx context.Context, pg *tsapi.Pro
 				reason := reasonProxyGroupCreationFailed
 				msg := fmt.Sprintf("error provisioning NodePort Services for static endpoints: %v", err)
 				r.recorder.Event(pg, corev1.EventTypeWarning, reason, msg)
-				return r.notReady(reason, msg)
+				return notReady(reason, msg)
 			}
-			return r.notReadyErrf(pg, "error provisioning NodePort Services for static endpoints: %w", err)
+			return r.notReadyErrf(pg, logger, "error provisioning NodePort Services for static endpoints: %w", err)
 		}
 	}
 
@@ -247,9 +309,9 @@ func (r *ProxyGroupReconciler) maybeProvision(ctx context.Context, pg *tsapi.Pro
 			reason := reasonProxyGroupCreationFailed
 			msg := fmt.Sprintf("error provisioning config Secrets: %v", err)
 			r.recorder.Event(pg, corev1.EventTypeWarning, reason, msg)
-			return r.notReady(reason, msg)
+			return notReady(reason, msg)
 		}
-		return r.notReadyErrf(pg, "error provisioning config Secrets: %w", err)
+		return r.notReadyErrf(pg, logger, "error provisioning config Secrets: %w", err)
 	}
 
 	// State secrets are precreated so we can use the ProxyGroup CR as their owner ref.
@@ -260,17 +322,24 @@ func (r *ProxyGroupReconciler) maybeProvision(ctx context.Context, pg *tsapi.Pro
 			s.ObjectMeta.Annotations = sec.ObjectMeta.Annotations
 			s.ObjectMeta.OwnerReferences = sec.ObjectMeta.OwnerReferences
 		}); err != nil {
-			return r.notReadyErrf(pg, "error provisioning state Secrets: %w", err)
+			return r.notReadyErrf(pg, logger, "error provisioning state Secrets: %w", err)
 		}
 	}
-	sa := pgServiceAccount(pg, r.tsNamespace)
-	if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, sa, func(s *corev1.ServiceAccount) {
-		s.ObjectMeta.Labels = sa.ObjectMeta.Labels
-		s.ObjectMeta.Annotations = sa.ObjectMeta.Annotations
-		s.ObjectMeta.OwnerReferences = sa.ObjectMeta.OwnerReferences
-	}); err != nil {
-		return r.notReadyErrf(pg, "error provisioning ServiceAccount: %w", err)
+
+	// auth mode kube-apiserver ProxyGroups use a statically created
+	// ServiceAccount to keep ClusterRole creation permissions limited to the
+	// helm chart installer.
+	if !isAuthAPIServerProxy(pg) {
+		sa := pgServiceAccount(pg, r.tsNamespace)
+		if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, sa, func(s *corev1.ServiceAccount) {
+			s.ObjectMeta.Labels = sa.ObjectMeta.Labels
+			s.ObjectMeta.Annotations = sa.ObjectMeta.Annotations
+			s.ObjectMeta.OwnerReferences = sa.ObjectMeta.OwnerReferences
+		}); err != nil {
+			return r.notReadyErrf(pg, logger, "error provisioning ServiceAccount: %w", err)
+		}
 	}
+
 	role := pgRole(pg, r.tsNamespace)
 	if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, role, func(r *rbacv1.Role) {
 		r.ObjectMeta.Labels = role.ObjectMeta.Labels
@@ -278,8 +347,9 @@ func (r *ProxyGroupReconciler) maybeProvision(ctx context.Context, pg *tsapi.Pro
 		r.ObjectMeta.OwnerReferences = role.ObjectMeta.OwnerReferences
 		r.Rules = role.Rules
 	}); err != nil {
-		return r.notReadyErrf(pg, "error provisioning Role: %w", err)
+		return r.notReadyErrf(pg, logger, "error provisioning Role: %w", err)
 	}
+
 	roleBinding := pgRoleBinding(pg, r.tsNamespace)
 	if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, roleBinding, func(r *rbacv1.RoleBinding) {
 		r.ObjectMeta.Labels = roleBinding.ObjectMeta.Labels
@@ -288,8 +358,9 @@ func (r *ProxyGroupReconciler) maybeProvision(ctx context.Context, pg *tsapi.Pro
 		r.RoleRef = roleBinding.RoleRef
 		r.Subjects = roleBinding.Subjects
 	}); err != nil {
-		return r.notReadyErrf(pg, "error provisioning RoleBinding: %w", err)
+		return r.notReadyErrf(pg, logger, "error provisioning RoleBinding: %w", err)
 	}
+
 	if pg.Spec.Type == tsapi.ProxyGroupTypeEgress {
 		cm, hp := pgEgressCM(pg, r.tsNamespace)
 		if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, cm, func(existing *corev1.ConfigMap) {
@@ -297,21 +368,27 @@ func (r *ProxyGroupReconciler) maybeProvision(ctx context.Context, pg *tsapi.Pro
 			existing.ObjectMeta.OwnerReferences = cm.ObjectMeta.OwnerReferences
 			mak.Set(&existing.BinaryData, egressservices.KeyHEPPings, hp)
 		}); err != nil {
-			return r.notReadyErrf(pg, "error provisioning egress ConfigMap %q: %w", cm.Name, err)
+			return r.notReadyErrf(pg, logger, "error provisioning egress ConfigMap %q: %w", cm.Name, err)
 		}
 	}
+
 	if pg.Spec.Type == tsapi.ProxyGroupTypeIngress {
 		cm := pgIngressCM(pg, r.tsNamespace)
 		if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, cm, func(existing *corev1.ConfigMap) {
 			existing.ObjectMeta.Labels = cm.ObjectMeta.Labels
 			existing.ObjectMeta.OwnerReferences = cm.ObjectMeta.OwnerReferences
 		}); err != nil {
-			return r.notReadyErrf(pg, "error provisioning ingress ConfigMap %q: %w", cm.Name, err)
+			return r.notReadyErrf(pg, logger, "error provisioning ingress ConfigMap %q: %w", cm.Name, err)
 		}
 	}
-	ss, err := pgStatefulSet(pg, r.tsNamespace, r.proxyImage, r.tsFirewallMode, tailscaledPort, proxyClass)
+
+	defaultImage := r.tsProxyImage
+	if pg.Spec.Type == tsapi.ProxyGroupTypeKubernetesAPIServer {
+		defaultImage = r.k8sProxyImage
+	}
+	ss, err := pgStatefulSet(pg, r.tsNamespace, defaultImage, r.tsFirewallMode, tailscaledPort, proxyClass)
 	if err != nil {
-		return r.notReadyErrf(pg, "error generating StatefulSet spec: %w", err)
+		return r.notReadyErrf(pg, logger, "error generating StatefulSet spec: %w", err)
 	}
 	cfg := &tailscaleSTSConfig{
 		proxyType: string(pg.Spec.Type),
@@ -324,7 +401,7 @@ func (r *ProxyGroupReconciler) maybeProvision(ctx context.Context, pg *tsapi.Pro
 		s.ObjectMeta.Annotations = ss.ObjectMeta.Annotations
 		s.ObjectMeta.OwnerReferences = ss.ObjectMeta.OwnerReferences
 	}); err != nil {
-		return r.notReadyErrf(pg, "error provisioning StatefulSet: %w", err)
+		return r.notReadyErrf(pg, logger, "error provisioning StatefulSet: %w", err)
 	}
 
 	mo := &metricsOpts{
@@ -334,11 +411,11 @@ func (r *ProxyGroupReconciler) maybeProvision(ctx context.Context, pg *tsapi.Pro
 		proxyType:    "proxygroup",
 	}
 	if err := reconcileMetricsResources(ctx, logger, mo, proxyClass, r.Client); err != nil {
-		return r.notReadyErrf(pg, "error reconciling metrics resources: %w", err)
+		return r.notReadyErrf(pg, logger, "error reconciling metrics resources: %w", err)
 	}
 
 	if err := r.cleanupDanglingResources(ctx, pg, proxyClass); err != nil {
-		return r.notReadyErrf(pg, "error cleaning up dangling resources: %w", err)
+		return r.notReadyErrf(pg, logger, "error cleaning up dangling resources: %w", err)
 	}
 
 	logger.Info("ProxyGroup resources synced")
@@ -350,6 +427,10 @@ func (r *ProxyGroupReconciler) maybeUpdateStatus(ctx context.Context, logger *za
 	defer func() {
 		if !apiequality.Semantic.DeepEqual(*oldPGStatus, pg.Status) {
 			if updateErr := r.Client.Status().Update(ctx, pg); updateErr != nil {
+				if strings.Contains(updateErr.Error(), optimisticLockErrorMsg) {
+					logger.Infof("optimistic lock error updating status, retrying: %s", updateErr)
+					updateErr = nil
+				}
 				err = errors.Join(err, updateErr)
 			}
 		}
@@ -371,12 +452,13 @@ func (r *ProxyGroupReconciler) maybeUpdateStatus(ctx context.Context, logger *za
 	if len(devices) > 0 {
 		status = metav1.ConditionTrue
 		if len(devices) == desiredReplicas {
-			reason = reasonProxyGroupReady
+			reason = reasonProxyGroupAvailable
 		}
 	}
 	tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupAvailable, status, reason, message, 0, r.clock, logger)
 
 	// Set ProxyGroupReady condition.
+	tsSvcValid, tsSvcSet := tsoperator.KubeAPIServerProxyValid(pg)
 	status = metav1.ConditionFalse
 	reason = reasonProxyGroupCreating
 	switch {
@@ -384,9 +466,15 @@ func (r *ProxyGroupReconciler) maybeUpdateStatus(ctx context.Context, logger *za
 		// If we failed earlier, that reason takes precedence.
 		reason = nrr.reason
 		message = nrr.message
+	case pg.Spec.Type == tsapi.ProxyGroupTypeKubernetesAPIServer && tsSvcSet && !tsSvcValid:
+		reason = reasonProxyGroupInvalid
+		message = "waiting for config in spec.kubeAPIServer to be marked valid"
 	case len(devices) < desiredReplicas:
 	case len(devices) > desiredReplicas:
 		message = fmt.Sprintf("waiting for %d ProxyGroup pods to shut down", len(devices)-desiredReplicas)
+	case pg.Spec.Type == tsapi.ProxyGroupTypeKubernetesAPIServer && !tsoperator.KubeAPIServerProxyConfigured(pg):
+		reason = reasonProxyGroupCreating
+		message = "waiting for proxies to start advertising the kube-apiserver proxy's hostname"
 	default:
 		status = metav1.ConditionTrue
 		reason = reasonProxyGroupReady
@@ -634,7 +722,7 @@ func (r *ProxyGroupReconciler) ensureConfigSecretsCreated(ctx context.Context, p
 			ObjectMeta: metav1.ObjectMeta{
 				Name:            pgConfigSecretName(pg.Name, i),
 				Namespace:       r.tsNamespace,
-				Labels:          pgSecretLabels(pg.Name, "config"),
+				Labels:          pgSecretLabels(pg.Name, kubetypes.LabelSecretTypeConfig),
 				OwnerReferences: pgOwnerReference(pg),
 			},
 		}
@@ -695,24 +783,110 @@ func (r *ProxyGroupReconciler) ensureConfigSecretsCreated(ctx context.Context, p
 			}
 		}
 
-		// AdvertiseServices config is set by ingress-pg-reconciler, so make sure we
-		// don't overwrite it if already set.
-		existingAdvertiseServices, err := extractAdvertiseServicesConfig(existingCfgSecret)
-		if err != nil {
-			return nil, err
-		}
+		if pg.Spec.Type == tsapi.ProxyGroupTypeKubernetesAPIServer {
+			hostname := pgHostname(pg, i)
 
-		configs, err := pgTailscaledConfig(pg, proxyClass, i, authKey, endpoints[nodePortSvcName], existingAdvertiseServices, r.loginServer)
-		if err != nil {
-			return nil, fmt.Errorf("error creating tailscaled config: %w", err)
-		}
-
-		for cap, cfg := range configs {
-			cfgJSON, err := json.Marshal(cfg)
-			if err != nil {
-				return nil, fmt.Errorf("error marshalling tailscaled config: %w", err)
+			if authKey == nil && existingCfgSecret != nil {
+				deviceAuthed := false
+				for _, d := range pg.Status.Devices {
+					if d.Hostname == hostname {
+						deviceAuthed = true
+						break
+					}
+				}
+				if !deviceAuthed {
+					existingCfg := conf.ConfigV1Alpha1{}
+					if err := json.Unmarshal(existingCfgSecret.Data[kubetypes.KubeAPIServerConfigFile], &existingCfg); err != nil {
+						return nil, fmt.Errorf("error unmarshalling existing config: %w", err)
+					}
+					if existingCfg.AuthKey != nil {
+						authKey = existingCfg.AuthKey
+					}
+				}
 			}
-			mak.Set(&cfgSecret.Data, tsoperator.TailscaledConfigFileName(cap), cfgJSON)
+
+			mode := kubetypes.APIServerProxyModeAuth
+			if !isAuthAPIServerProxy(pg) {
+				mode = kubetypes.APIServerProxyModeNoAuth
+			}
+			cfg := conf.VersionedConfig{
+				Version: "v1alpha1",
+				ConfigV1Alpha1: &conf.ConfigV1Alpha1{
+					AuthKey:  authKey,
+					State:    ptr.To(fmt.Sprintf("kube:%s", pgPodName(pg.Name, i))),
+					App:      ptr.To(kubetypes.AppProxyGroupKubeAPIServer),
+					LogLevel: ptr.To(logger.Level().String()),
+
+					// Reloadable fields.
+					Hostname: &hostname,
+					APIServerProxy: &conf.APIServerProxyConfig{
+						Enabled: opt.NewBool(true),
+						Mode:    &mode,
+						// The first replica is elected as the cert issuer, same
+						// as containerboot does for ingress-pg-reconciler.
+						IssueCerts: opt.NewBool(i == 0),
+					},
+					LocalPort:          ptr.To(uint16(9002)),
+					HealthCheckEnabled: opt.NewBool(true),
+				},
+			}
+
+			// Copy over config that the apiserver-proxy-service-reconciler sets.
+			if existingCfgSecret != nil {
+				if k8sProxyCfg, ok := cfgSecret.Data[kubetypes.KubeAPIServerConfigFile]; ok {
+					k8sCfg := &conf.ConfigV1Alpha1{}
+					if err := json.Unmarshal(k8sProxyCfg, k8sCfg); err != nil {
+						return nil, fmt.Errorf("failed to unmarshal kube-apiserver config: %w", err)
+					}
+
+					cfg.AdvertiseServices = k8sCfg.AdvertiseServices
+					if k8sCfg.APIServerProxy != nil {
+						cfg.APIServerProxy.ServiceName = k8sCfg.APIServerProxy.ServiceName
+					}
+				}
+			}
+
+			if r.loginServer != "" {
+				cfg.ServerURL = &r.loginServer
+			}
+
+			if proxyClass != nil && proxyClass.Spec.TailscaleConfig != nil {
+				cfg.AcceptRoutes = opt.NewBool(proxyClass.Spec.TailscaleConfig.AcceptRoutes)
+			}
+
+			if proxyClass != nil && proxyClass.Spec.Metrics != nil {
+				cfg.MetricsEnabled = opt.NewBool(proxyClass.Spec.Metrics.Enable)
+			}
+
+			if len(endpoints[nodePortSvcName]) > 0 {
+				cfg.StaticEndpoints = endpoints[nodePortSvcName]
+			}
+
+			cfgB, err := json.Marshal(cfg)
+			if err != nil {
+				return nil, fmt.Errorf("error marshalling k8s-proxy config: %w", err)
+			}
+			mak.Set(&cfgSecret.Data, kubetypes.KubeAPIServerConfigFile, cfgB)
+		} else {
+			// AdvertiseServices config is set by ingress-pg-reconciler, so make sure we
+			// don't overwrite it if already set.
+			existingAdvertiseServices, err := extractAdvertiseServicesConfig(existingCfgSecret)
+			if err != nil {
+				return nil, err
+			}
+
+			configs, err := pgTailscaledConfig(pg, proxyClass, i, authKey, endpoints[nodePortSvcName], existingAdvertiseServices, r.loginServer)
+			if err != nil {
+				return nil, fmt.Errorf("error creating tailscaled config: %w", err)
+			}
+
+			for cap, cfg := range configs {
+				cfgJSON, err := json.Marshal(cfg)
+				if err != nil {
+					return nil, fmt.Errorf("error marshalling tailscaled config: %w", err)
+				}
+				mak.Set(&cfgSecret.Data, tsoperator.TailscaledConfigFileName(cap), cfgJSON)
+			}
 		}
 
 		if existingCfgSecret != nil {
@@ -834,9 +1008,12 @@ func (r *ProxyGroupReconciler) ensureAddedToGaugeForProxyGroup(pg *tsapi.ProxyGr
 		r.egressProxyGroups.Add(pg.UID)
 	case tsapi.ProxyGroupTypeIngress:
 		r.ingressProxyGroups.Add(pg.UID)
+	case tsapi.ProxyGroupTypeKubernetesAPIServer:
+		r.apiServerProxyGroups.Add(pg.UID)
 	}
 	gaugeEgressProxyGroupResources.Set(int64(r.egressProxyGroups.Len()))
 	gaugeIngressProxyGroupResources.Set(int64(r.ingressProxyGroups.Len()))
+	gaugeAPIServerProxyGroupResources.Set(int64(r.apiServerProxyGroups.Len()))
 }
 
 // ensureRemovedFromGaugeForProxyGroup ensures the gauge metric for the ProxyGroup resource type is updated when the
@@ -847,9 +1024,12 @@ func (r *ProxyGroupReconciler) ensureRemovedFromGaugeForProxyGroup(pg *tsapi.Pro
 		r.egressProxyGroups.Remove(pg.UID)
 	case tsapi.ProxyGroupTypeIngress:
 		r.ingressProxyGroups.Remove(pg.UID)
+	case tsapi.ProxyGroupTypeKubernetesAPIServer:
+		r.apiServerProxyGroups.Remove(pg.UID)
 	}
 	gaugeEgressProxyGroupResources.Set(int64(r.egressProxyGroups.Len()))
 	gaugeIngressProxyGroupResources.Set(int64(r.ingressProxyGroups.Len()))
+	gaugeAPIServerProxyGroupResources.Set(int64(r.apiServerProxyGroups.Len()))
 }
 
 func pgTailscaledConfig(pg *tsapi.ProxyGroup, pc *tsapi.ProxyClass, idx int32, authKey *string, staticEndpoints []netip.AddrPort, oldAdvertiseServices []string, loginServer string) (tailscaledConfigs, error) {
@@ -858,17 +1038,13 @@ func pgTailscaledConfig(pg *tsapi.ProxyGroup, pc *tsapi.ProxyClass, idx int32, a
 		AcceptDNS:         "false",
 		AcceptRoutes:      "false", // AcceptRoutes defaults to true
 		Locked:            "false",
-		Hostname:          ptr.To(fmt.Sprintf("%s-%d", pg.Name, idx)),
+		Hostname:          ptr.To(pgHostname(pg, idx)),
 		AdvertiseServices: oldAdvertiseServices,
 		AuthKey:           authKey,
 	}
 
 	if loginServer != "" {
 		conf.ServerURL = &loginServer
-	}
-
-	if pg.Spec.HostnamePrefix != "" {
-		conf.Hostname = ptr.To(fmt.Sprintf("%s-%d", pg.Spec.HostnamePrefix, idx))
 	}
 
 	if shouldAcceptRoutes(pc) {
@@ -889,16 +1065,16 @@ func extractAdvertiseServicesConfig(cfgSecret *corev1.Secret) ([]string, error) 
 		return nil, nil
 	}
 
-	conf, err := latestConfigFromSecret(cfgSecret)
+	cfg, err := latestConfigFromSecret(cfgSecret)
 	if err != nil {
 		return nil, err
 	}
 
-	if conf == nil {
+	if cfg == nil {
 		return nil, nil
 	}
 
-	return conf.AdvertiseServices, nil
+	return cfg.AdvertiseServices, nil
 }
 
 // getNodeMetadata gets metadata for all the pods owned by this ProxyGroup by
@@ -910,7 +1086,7 @@ func extractAdvertiseServicesConfig(cfgSecret *corev1.Secret) ([]string, error) 
 func (r *ProxyGroupReconciler) getNodeMetadata(ctx context.Context, pg *tsapi.ProxyGroup) (metadata []nodeMetadata, _ error) {
 	// List all state Secrets owned by this ProxyGroup.
 	secrets := &corev1.SecretList{}
-	if err := r.List(ctx, secrets, client.InNamespace(r.tsNamespace), client.MatchingLabels(pgSecretLabels(pg.Name, "state"))); err != nil {
+	if err := r.List(ctx, secrets, client.InNamespace(r.tsNamespace), client.MatchingLabels(pgSecretLabels(pg.Name, kubetypes.LabelSecretTypeState))); err != nil {
 		return nil, fmt.Errorf("failed to list state Secrets: %w", err)
 	}
 	for _, secret := range secrets.Items {
@@ -1005,15 +1181,21 @@ type nodeMetadata struct {
 	dnsName     string
 }
 
-func (r *ProxyGroupReconciler) notReady(reason, msg string) (map[string][]netip.AddrPort, *notReadyReason, error) {
+func notReady(reason, msg string) (map[string][]netip.AddrPort, *notReadyReason, error) {
 	return nil, &notReadyReason{
 		reason:  reason,
 		message: msg,
 	}, nil
 }
 
-func (r *ProxyGroupReconciler) notReadyErrf(pg *tsapi.ProxyGroup, format string, a ...any) (map[string][]netip.AddrPort, *notReadyReason, error) {
+func (r *ProxyGroupReconciler) notReadyErrf(pg *tsapi.ProxyGroup, logger *zap.SugaredLogger, format string, a ...any) (map[string][]netip.AddrPort, *notReadyReason, error) {
 	err := fmt.Errorf(format, a...)
+	if strings.Contains(err.Error(), optimisticLockErrorMsg) {
+		msg := fmt.Sprintf("optimistic lock error, retrying: %s", err.Error())
+		logger.Info(msg)
+		return notReady(reasonProxyGroupCreating, msg)
+	}
+
 	r.recorder.Event(pg, corev1.EventTypeWarning, reasonProxyGroupCreationFailed, err.Error())
 	return nil, &notReadyReason{
 		reason:  reasonProxyGroupCreationFailed,

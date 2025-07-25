@@ -104,28 +104,29 @@ type endpoint struct {
 // be installed as de.bestAddr. It is only called by [relayManager] once it has
 // determined maybeBest is functional via [disco.Pong] reception.
 func (de *endpoint) udpRelayEndpointReady(maybeBest addrQuality) {
-	de.c.mu.Lock()
-	defer de.c.mu.Unlock()
 	de.mu.Lock()
 	defer de.mu.Unlock()
+	now := mono.Now()
+	curBestAddrTrusted := now.Before(de.trustBestAddrUntil)
+	sameRelayServer := de.bestAddr.vni.isSet() && maybeBest.relayServerDisco.Compare(de.bestAddr.relayServerDisco) == 0
 
-	if maybeBest.relayServerDisco.Compare(de.bestAddr.relayServerDisco) == 0 {
-		// TODO(jwhited): add some observability for this case, e.g. did we
-		//  flip transports during a de.bestAddr transition from untrusted to
-		//  trusted?
+	if !curBestAddrTrusted ||
+		sameRelayServer ||
+		betterAddr(maybeBest, de.bestAddr) {
+		// We must set maybeBest as de.bestAddr if:
+		//   1. de.bestAddr is untrusted. betterAddr does not consider
+		//      time-based trust.
+		//   2. maybeBest & de.bestAddr are on the same relay. If the maybeBest
+		//      handshake happened to use a different source address/transport,
+		//      the relay will drop packets from the 'old' de.bestAddr's.
+		//   3. maybeBest is a 'betterAddr'.
 		//
-		// If these are equal we must set maybeBest as bestAddr, otherwise we
-		// could leave a stale bestAddr if it goes over a different
-		// address family or src.
-	} else if !betterAddr(maybeBest, de.bestAddr) {
-		return
+		// TODO(jwhited): add observability around !curBestAddrTrusted and sameRelayServer
+		// TODO(jwhited): collapse path change logging with endpoint.handlePongConnLocked()
+		de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v", de.publicKey.ShortString(), de.discoShort(), maybeBest.epAddr, maybeBest.wireMTU)
+		de.setBestAddrLocked(maybeBest)
+		de.trustBestAddrUntil = now.Add(trustUDPAddrDuration)
 	}
-
-	// Promote maybeBest to bestAddr.
-	// TODO(jwhited): collapse path change logging with endpoint.handlePongConnLocked()
-	de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v", de.publicKey.ShortString(), de.discoShort(), maybeBest.epAddr, maybeBest.wireMTU)
-	de.setBestAddrLocked(maybeBest)
-	de.trustBestAddrUntil = mono.Now().Add(trustUDPAddrDuration)
 }
 
 func (de *endpoint) setBestAddrLocked(v addrQuality) {
@@ -499,8 +500,9 @@ func (de *endpoint) initFakeUDPAddr() {
 }
 
 // noteRecvActivity records receive activity on de, and invokes
-// Conn.noteRecvActivity no more than once every 10s.
-func (de *endpoint) noteRecvActivity(src epAddr, now mono.Time) {
+// Conn.noteRecvActivity no more than once every 10s, returning true if it
+// was called, otherwise false.
+func (de *endpoint) noteRecvActivity(src epAddr, now mono.Time) bool {
 	if de.isWireguardOnly {
 		de.mu.Lock()
 		de.bestAddr.ap = src.ap
@@ -524,10 +526,12 @@ func (de *endpoint) noteRecvActivity(src epAddr, now mono.Time) {
 		de.lastRecvWG.StoreAtomic(now)
 
 		if de.c.noteRecvActivity == nil {
-			return
+			return false
 		}
 		de.c.noteRecvActivity(de.publicKey)
+		return true
 	}
+	return false
 }
 
 func (de *endpoint) discoShort() string {
@@ -875,8 +879,14 @@ func (de *endpoint) setHeartbeatDisabled(v bool) {
 
 // discoverUDPRelayPathsLocked starts UDP relay path discovery.
 func (de *endpoint) discoverUDPRelayPathsLocked(now mono.Time) {
-	// TODO(jwhited): return early if there are no relay servers set, otherwise
-	//  we spin up and down relayManager.runLoop unnecessarily.
+	if !de.c.hasPeerRelayServers.Load() {
+		// Changes in this value between its access and the logic following
+		// are fine, we will eventually do the "right" thing during future path
+		// discovery. The worst case is we suppress path discovery for the
+		// current cycle, or we unnecessarily call into [relayManager] and do
+		// some wasted work.
+		return
+	}
 	de.lastUDPRelayPathDiscovery = now
 	lastBest := de.bestAddr
 	lastBestIsTrusted := mono.Now().Before(de.trustBestAddrUntil)
@@ -1060,11 +1070,21 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 
 		switch {
 		case udpAddr.ap.Addr().Is4():
-			de.c.metrics.outboundPacketsIPv4Total.Add(int64(len(buffs)))
-			de.c.metrics.outboundBytesIPv4Total.Add(int64(txBytes))
+			if udpAddr.vni.isSet() {
+				de.c.metrics.outboundPacketsPeerRelayIPv4Total.Add(int64(len(buffs)))
+				de.c.metrics.outboundBytesPeerRelayIPv4Total.Add(int64(txBytes))
+			} else {
+				de.c.metrics.outboundPacketsIPv4Total.Add(int64(len(buffs)))
+				de.c.metrics.outboundBytesIPv4Total.Add(int64(txBytes))
+			}
 		case udpAddr.ap.Addr().Is6():
-			de.c.metrics.outboundPacketsIPv6Total.Add(int64(len(buffs)))
-			de.c.metrics.outboundBytesIPv6Total.Add(int64(txBytes))
+			if udpAddr.vni.isSet() {
+				de.c.metrics.outboundPacketsPeerRelayIPv6Total.Add(int64(len(buffs)))
+				de.c.metrics.outboundBytesPeerRelayIPv6Total.Add(int64(txBytes))
+			} else {
+				de.c.metrics.outboundPacketsIPv6Total.Add(int64(len(buffs)))
+				de.c.metrics.outboundBytesIPv6Total.Add(int64(txBytes))
+			}
 		}
 
 		// TODO(raggi): needs updating for accuracy, as in error conditions we may have partial sends.
@@ -1078,7 +1098,8 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 		for _, buff := range buffs {
 			buff = buff[offset:]
 			const isDisco = false
-			ok, _ := de.c.sendAddr(derpAddr, de.publicKey, buff, isDisco)
+			const isGeneveEncap = false
+			ok, _ := de.c.sendAddr(derpAddr, de.publicKey, buff, isDisco, isGeneveEncap)
 			txBytes += len(buff)
 			if !ok {
 				allOk = false
@@ -1656,13 +1677,6 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 	de.mu.Lock()
 	defer de.mu.Unlock()
 
-	if src.vni.isSet() && src != de.bestAddr.epAddr {
-		// "src" is not our bestAddr, but [relayManager] might be in the
-		// middle of probing it, awaiting pong reception. Make it aware.
-		de.c.relayManager.handleGeneveEncapDiscoMsgNotBestAddr(de.c, m, di, src)
-		return false
-	}
-
 	isDerp := src.ap.Addr() == tailcfg.DerpMagicIPAddr
 
 	sp, ok := de.sentPing[m.TxID]
@@ -1968,10 +1982,11 @@ func (de *endpoint) populatePeerStatus(ps *ipnstate.PeerStatus) {
 	ps.Active = now.Sub(de.lastSendExt) < sessionActiveTimeout
 
 	if udpAddr, derpAddr, _ := de.addrForSendLocked(now); udpAddr.ap.IsValid() && !derpAddr.IsValid() {
-		// TODO(jwhited): if udpAddr.vni.isSet() we are using a Tailscale client
-		//  as a UDP relay; update PeerStatus and its interpretation by
-		//  "tailscale status" to make this clear.
-		ps.CurAddr = udpAddr.String()
+		if udpAddr.vni.isSet() {
+			ps.PeerRelay = udpAddr.String()
+		} else {
+			ps.CurAddr = udpAddr.String()
+		}
 	}
 }
 
@@ -2026,8 +2041,15 @@ func (de *endpoint) numStopAndReset() int64 {
 	return atomic.LoadInt64(&de.numStopAndResetAtomic)
 }
 
+// setDERPHome sets the provided regionID as home for de. Calls to setDERPHome
+// must never run concurrent to [Conn.updateRelayServersSet], otherwise
+// [candidatePeerRelay] DERP home changes may be missed from the perspective of
+// [relayManager].
 func (de *endpoint) setDERPHome(regionID uint16) {
 	de.mu.Lock()
 	defer de.mu.Unlock()
 	de.derpAddr = netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, uint16(regionID))
+	if de.c.hasPeerRelayServers.Load() {
+		de.c.relayManager.handleDERPHomeChange(de.publicKey, regionID)
+	}
 }

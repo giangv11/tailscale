@@ -163,7 +163,11 @@ type CapabilityVersion int
 //   - 116: 2025-05-05: Client serves MagicDNS "AAAA" if NodeAttrMagicDNSPeerAAAA set on self node
 //   - 117: 2025-05-28: Client understands DisplayMessages (structured health messages), but not necessarily PrimaryAction.
 //   - 118: 2025-07-01: Client sends Hostinfo.StateEncrypted to report whether the state file is encrypted at rest (#15830)
-const CurrentCapabilityVersion CapabilityVersion = 118
+//   - 119: 2025-07-10: Client uses Hostinfo.Location.Priority to prioritize one route over another.
+//   - 120: 2025-07-15: Client understands peer relay disco messages, and implements peer client and relay server functions
+//   - 121: 2025-07-19: Client understands peer relay endpoint alloc with [disco.AllocateUDPRelayEndpointRequest] & [disco.AllocateUDPRelayEndpointResponse]
+//   - 122: 2025-07-21: Client sends Hostinfo.ExitNodeID to report which exit node it has selected, if any.
+const CurrentCapabilityVersion CapabilityVersion = 122
 
 // ID is an integer ID for a user, node, or login allocated by the
 // control plane.
@@ -872,6 +876,7 @@ type Hostinfo struct {
 	UserspaceRouter opt.Bool       `json:",omitempty"` // if the client's subnet router is running in userspace (netstack) mode
 	AppConnector    opt.Bool       `json:",omitempty"` // if the client is running the app-connector service
 	ServicesHash    string         `json:",omitempty"` // opaque hash of the most recent list of tailnet services, change in hash indicates config should be fetched via c2n
+	ExitNodeID      StableNodeID   `json:",omitzero"`  // the client’s selected exit node, empty when unselected.
 
 	// Location represents geographical location data about a
 	// Tailscale host. Location is optional and only set if
@@ -924,6 +929,16 @@ func (t *TPMInfo) Present() bool { return t != nil }
 // the only type of service is [VIPService].
 // This is not related to the older [Service] used in [Hostinfo.Services].
 type ServiceName string
+
+// AsServiceName reports whether the given string is a valid service name.
+// If so returns the name as a [tailcfg.ServiceName], otherwise returns "".
+func AsServiceName(s string) ServiceName {
+	svcName := ServiceName(s)
+	if err := svcName.Validate(); err != nil {
+		return ""
+	}
+	return svcName
+}
 
 // Validate validates if the service name is formatted correctly.
 // We only allow valid DNS labels, since the expectation is that these will be
@@ -1854,9 +1869,13 @@ type PingResponse struct {
 	// omitted, Err should contain information as to the cause.
 	LatencySeconds float64 `json:",omitempty"`
 
-	// Endpoint is the ip:port if direct UDP was used.
-	// It is not currently set for TSMP pings.
+	// Endpoint is a string of the form "{ip}:{port}" if direct UDP was used. It
+	// is not currently set for TSMP.
 	Endpoint string `json:",omitempty"`
+
+	// PeerRelay is a string of the form "{ip}:{port}:vni:{vni}" if a peer
+	// relay was used. It is not currently set for TSMP.
+	PeerRelay string `json:",omitempty"`
 
 	// DERPRegionID is non-zero DERP region ID if DERP was used.
 	// It is not currently set for TSMP pings.
@@ -2166,7 +2185,10 @@ func (m DisplayMessage) Equal(o DisplayMessage) bool {
 	return m.Title == o.Title &&
 		m.Text == o.Text &&
 		m.Severity == o.Severity &&
-		m.ImpactsConnectivity == o.ImpactsConnectivity
+		m.ImpactsConnectivity == o.ImpactsConnectivity &&
+		(m.PrimaryAction == nil) == (o.PrimaryAction == nil) &&
+		(m.PrimaryAction == nil || (m.PrimaryAction.URL == o.PrimaryAction.URL &&
+			m.PrimaryAction.Label == o.PrimaryAction.Label))
 }
 
 // DisplayMessageSeverity represents how serious a [DisplayMessage] is. Analogous
@@ -2607,19 +2629,25 @@ const (
 	// only needs to be present in [NodeCapMap] to take effect.
 	NodeAttrDisableRelayServer NodeCapability = "disable-relay-server"
 
-	// NodeAttrDisableRelayClient prevents the node from allocating UDP relay
-	// server endpoints itself; the node may still bind into and relay traffic
-	// using endpoints allocated by its peers. This attribute can be added to
-	// the node dynamically; if added while the node is already running, the
-	// node will be unable to allocate UDP relay server endpoints after it next
-	// updates its network map. There are no expected values for this key in
-	// [NodeCapMap]; the key only needs to be present in [NodeCapMap] to take
-	// effect.
+	// NodeAttrDisableRelayClient prevents the node from both allocating UDP
+	// relay server endpoints itself, and from using endpoints allocated by
+	// its peers. This attribute can be added to the node dynamically; if added
+	// while the node is already running, the node will be unable to allocate
+	// endpoints after it next updates its network map, and will be immediately
+	// unable to use new paths via a UDP relay server. Setting this attribute
+	// dynamically does not remove any existing paths, including paths that
+	// traverse a UDP relay server. There are no expected values for this key
+	// in [NodeCapMap]; the key only needs to be present in [NodeCapMap] to
+	// take effect.
 	NodeAttrDisableRelayClient NodeCapability = "disable-relay-client"
 
 	// NodeAttrMagicDNSPeerAAAA is a capability that tells the node's MagicDNS
 	// server to answer AAAA queries about its peers. See tailscale/tailscale#1152.
 	NodeAttrMagicDNSPeerAAAA NodeCapability = "magicdns-aaaa"
+
+	// NodeAttrTrafficSteering configures the node to use the traffic
+	// steering subsystem for via routes. See tailscale/corp#29966.
+	NodeAttrTrafficSteering NodeCapability = "traffic-steering"
 )
 
 // SetDNSRequest is a request to add a DNS record.
