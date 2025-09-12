@@ -5,6 +5,7 @@ package ipn
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,7 +29,8 @@ import (
 	"tailscale.com/types/preftype"
 	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
-	"tailscale.com/util/syspolicy"
+	"tailscale.com/util/syspolicy/pkey"
+	"tailscale.com/util/syspolicy/policyclient"
 	"tailscale.com/version"
 )
 
@@ -158,11 +160,10 @@ type Prefs struct {
 	// connections. This overrides tailcfg.Hostinfo's ShieldsUp.
 	ShieldsUp bool
 
-	// AdvertiseTags specifies groups that this node wants to join, for
-	// purposes of ACL enforcement. These can be referenced from the ACL
-	// security policy. Note that advertising a tag doesn't guarantee that
-	// the control server will allow you to take on the rights for that
-	// tag.
+	// AdvertiseTags specifies tags that should be applied to this node, for
+	// purposes of ACL enforcement. These can be referenced from the ACL policy
+	// document. Note that advertising a tag on the client doesn't guarantee
+	// that the control server will allow the node to adopt that tag.
 	AdvertiseTags []string
 
 	// Hostname is the hostname to use for identifying the node. If
@@ -718,16 +719,16 @@ func NewPrefs() *Prefs {
 //
 // If not configured, or if the configured value is a legacy name equivalent to
 // the default, then DefaultControlURL is returned instead.
-func (p PrefsView) ControlURLOrDefault() string {
-	return p.ж.ControlURLOrDefault()
+func (p PrefsView) ControlURLOrDefault(polc policyclient.Client) string {
+	return p.ж.ControlURLOrDefault(polc)
 }
 
 // ControlURLOrDefault returns the coordination server's URL base.
 //
 // If not configured, or if the configured value is a legacy name equivalent to
 // the default, then DefaultControlURL is returned instead.
-func (p *Prefs) ControlURLOrDefault() string {
-	controlURL, err := syspolicy.GetString(syspolicy.ControlURL, p.ControlURL)
+func (p *Prefs) ControlURLOrDefault(polc policyclient.Client) string {
+	controlURL, err := polc.GetString(pkey.ControlURL, p.ControlURL)
 	if err != nil {
 		controlURL = p.ControlURL
 	}
@@ -756,11 +757,11 @@ func (p *Prefs) DefaultRouteAll(goos string) bool {
 }
 
 // AdminPageURL returns the admin web site URL for the current ControlURL.
-func (p PrefsView) AdminPageURL() string { return p.ж.AdminPageURL() }
+func (p PrefsView) AdminPageURL(polc policyclient.Client) string { return p.ж.AdminPageURL(polc) }
 
 // AdminPageURL returns the admin web site URL for the current ControlURL.
-func (p *Prefs) AdminPageURL() string {
-	url := p.ControlURLOrDefault()
+func (p *Prefs) AdminPageURL(polc policyclient.Client) string {
+	url := p.ControlURLOrDefault(polc)
 	if IsLoginServerSynonym(url) {
 		// TODO(crawshaw): In future release, make this https://console.tailscale.com
 		url = "https://login.tailscale.com"
@@ -847,6 +848,9 @@ func exitNodeIPOfArg(s string, st *ipnstate.Status) (ip netip.Addr, err error) {
 	}
 	ip, err = netip.ParseAddr(s)
 	if err == nil {
+		if !isRemoteIP(st, ip) {
+			return ip, ExitNodeLocalIPError{s}
+		}
 		// If we're online already and have a netmap, double check that the IP
 		// address specified is valid.
 		if st.BackendState == "Running" {
@@ -857,9 +861,6 @@ func exitNodeIPOfArg(s string, st *ipnstate.Status) (ip netip.Addr, err error) {
 			if !ps.ExitNodeOption {
 				return ip, fmt.Errorf("node %v is not advertising an exit node", ip)
 			}
-		}
-		if !isRemoteIP(st, ip) {
-			return ip, ExitNodeLocalIPError{s}
 		}
 		return ip, nil
 	}
@@ -988,6 +989,7 @@ type WindowsUserID string
 type NetworkProfile struct {
 	MagicDNSName string
 	DomainName   string
+	DisplayName  string
 }
 
 // RequiresBackfill returns whether this object does not have all the data
@@ -998,6 +1000,13 @@ type NetworkProfile struct {
 // do more explicit checks to return whether it's apt for a backfill or not.
 func (n NetworkProfile) RequiresBackfill() bool {
 	return n == NetworkProfile{}
+}
+
+// DisplayNameOrDefault will always return a non-empty string.
+// If there is a defined display name, it will return that.
+// If they did not it will default to their domain name.
+func (n NetworkProfile) DisplayNameOrDefault() string {
+	return cmp.Or(n.DisplayName, n.DomainName)
 }
 
 // LoginProfile represents a single login profile as managed

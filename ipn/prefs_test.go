@@ -23,6 +23,7 @@ import (
 	"tailscale.com/types/opt"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
+	"tailscale.com/util/syspolicy/policyclient"
 )
 
 func fieldsOf(t reflect.Type) (fields []string) {
@@ -897,6 +898,23 @@ func TestExitNodeIPOfArg(t *testing.T) {
 			wantErr: `no node found in netmap with IP 1.2.3.4`,
 		},
 		{
+			name: "ip_is_self",
+			arg:  "1.2.3.4",
+			st: &ipnstate.Status{
+				TailscaleIPs: []netip.Addr{mustIP("1.2.3.4")},
+			},
+			wantErr: "cannot use 1.2.3.4 as an exit node as it is a local IP address to this machine",
+		},
+		{
+			name: "ip_is_self_when_backend_running",
+			arg:  "1.2.3.4",
+			st: &ipnstate.Status{
+				BackendState: "Running",
+				TailscaleIPs: []netip.Addr{mustIP("1.2.3.4")},
+			},
+			wantErr: "cannot use 1.2.3.4 as an exit node as it is a local IP address to this machine",
+		},
+		{
 			name: "ip_not_exit",
 			arg:  "1.2.3.4",
 			st: &ipnstate.Status{
@@ -1032,15 +1050,16 @@ func TestExitNodeIPOfArg(t *testing.T) {
 
 func TestControlURLOrDefault(t *testing.T) {
 	var p Prefs
-	if got, want := p.ControlURLOrDefault(), DefaultControlURL; got != want {
+	polc := policyclient.NoPolicyClient{}
+	if got, want := p.ControlURLOrDefault(polc), DefaultControlURL; got != want {
 		t.Errorf("got %q; want %q", got, want)
 	}
 	p.ControlURL = "http://foo.bar"
-	if got, want := p.ControlURLOrDefault(), "http://foo.bar"; got != want {
+	if got, want := p.ControlURLOrDefault(polc), "http://foo.bar"; got != want {
 		t.Errorf("got %q; want %q", got, want)
 	}
 	p.ControlURL = "https://login.tailscale.com"
-	if got, want := p.ControlURLOrDefault(), DefaultControlURL; got != want {
+	if got, want := p.ControlURLOrDefault(polc), DefaultControlURL; got != want {
 		t.Errorf("got %q; want %q", got, want)
 	}
 }

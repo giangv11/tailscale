@@ -7,6 +7,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -98,7 +99,7 @@ func TestMutexValue(t *testing.T) {
 		t.Errorf("Load = %v, want %v", v.Load(), now)
 	}
 
-	var group WaitGroup
+	var group sync.WaitGroup
 	var v2 MutexValue[int]
 	var sum int
 	for i := range 10 {
@@ -161,10 +162,20 @@ func TestClosedChan(t *testing.T) {
 
 func TestSemaphore(t *testing.T) {
 	s := NewSemaphore(2)
+	assertLen := func(want int) {
+		t.Helper()
+		if got := s.Len(); got != want {
+			t.Fatalf("Len = %d, want %d", got, want)
+		}
+	}
+
+	assertLen(0)
 	s.Acquire()
+	assertLen(1)
 	if !s.TryAcquire() {
 		t.Fatal("want true")
 	}
+	assertLen(2)
 	if s.TryAcquire() {
 		t.Fatal("want false")
 	}
@@ -174,11 +185,15 @@ func TestSemaphore(t *testing.T) {
 		t.Fatal("want false")
 	}
 	s.Release()
+	assertLen(1)
 	if !s.AcquireContext(context.Background()) {
 		t.Fatal("want true")
 	}
+	assertLen(2)
 	s.Release()
+	assertLen(1)
 	s.Release()
+	assertLen(0)
 }
 
 func TestMap(t *testing.T) {
@@ -237,7 +252,7 @@ func TestMap(t *testing.T) {
 
 	t.Run("LoadOrStore", func(t *testing.T) {
 		var m Map[string, string]
-		var wg WaitGroup
+		var wg sync.WaitGroup
 		var ok1, ok2 bool
 		wg.Go(func() { _, ok1 = m.LoadOrStore("", "") })
 		wg.Go(func() { _, ok2 = m.LoadOrStore("", "") })

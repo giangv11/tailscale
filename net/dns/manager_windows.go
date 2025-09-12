@@ -29,9 +29,9 @@ import (
 	"tailscale.com/health"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
-	"tailscale.com/util/syspolicy"
-	"tailscale.com/util/syspolicy/rsop"
-	"tailscale.com/util/syspolicy/setting"
+	"tailscale.com/util/syspolicy/pkey"
+	"tailscale.com/util/syspolicy/policyclient"
+	"tailscale.com/util/syspolicy/ptype"
 	"tailscale.com/util/winutil"
 )
 
@@ -47,6 +47,7 @@ type windowsManager struct {
 	knobs      *controlknobs.Knobs // or nil
 	nrptDB     *nrptRuleDatabase
 	wslManager *wslManager
+	polc       policyclient.Client
 
 	unregisterPolicyChangeCb func() // called when the manager is closing
 
@@ -57,11 +58,15 @@ type windowsManager struct {
 // NewOSConfigurator created a new OS configurator.
 //
 // The health tracker and the knobs may be nil.
-func NewOSConfigurator(logf logger.Logf, health *health.Tracker, knobs *controlknobs.Knobs, interfaceName string) (OSConfigurator, error) {
+func NewOSConfigurator(logf logger.Logf, health *health.Tracker, polc policyclient.Client, knobs *controlknobs.Knobs, interfaceName string) (OSConfigurator, error) {
+	if polc == nil {
+		panic("nil policyclient.Client")
+	}
 	ret := &windowsManager{
 		logf:       logf,
 		guid:       interfaceName,
 		knobs:      knobs,
+		polc:       polc,
 		wslManager: newWSLManager(logf, health),
 	}
 
@@ -70,7 +75,7 @@ func NewOSConfigurator(logf logger.Logf, health *health.Tracker, knobs *controlk
 	}
 
 	var err error
-	if ret.unregisterPolicyChangeCb, err = syspolicy.RegisterChangeCallback(ret.sysPolicyChanged); err != nil {
+	if ret.unregisterPolicyChangeCb, err = polc.RegisterChangeCallback(ret.sysPolicyChanged); err != nil {
 		logf("error registering policy change callback: %v", err) // non-fatal
 	}
 
@@ -507,8 +512,8 @@ func (m *windowsManager) Close() error {
 
 // sysPolicyChanged is a callback triggered by [syspolicy] when it detects
 // a change in one or more syspolicy settings.
-func (m *windowsManager) sysPolicyChanged(policy *rsop.PolicyChange) {
-	if policy.HasChanged(syspolicy.EnableDNSRegistration) {
+func (m *windowsManager) sysPolicyChanged(policy policyclient.PolicyChange) {
+	if policy.HasChanged(pkey.EnableDNSRegistration) {
 		m.reconfigureDNSRegistration()
 	}
 }
@@ -520,7 +525,7 @@ func (m *windowsManager) reconfigureDNSRegistration() {
 	// Disable DNS registration by default (if the policy setting is not configured).
 	// This is primarily for historical reasons and to avoid breaking existing
 	// setups that rely on this behavior.
-	enableDNSRegistration, err := syspolicy.GetPreferenceOptionOrDefault(syspolicy.EnableDNSRegistration, setting.NeverByPolicy)
+	enableDNSRegistration, err := m.polc.GetPreferenceOption(pkey.EnableDNSRegistration, ptype.NeverByPolicy)
 	if err != nil {
 		m.logf("error getting DNSRegistration policy setting: %v", err) // non-fatal; we'll use the default
 	}

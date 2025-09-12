@@ -30,7 +30,7 @@ import (
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"golang.org/x/net/http/httpproxy"
 	"golang.org/x/net/http2"
-	"tailscale.com/client/tailscale"
+	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/control/controlhttp"
 	"tailscale.com/hostinfo"
@@ -373,6 +373,17 @@ func debugCmd() *ffcli.Command {
 				ShortUsage: "tailscale debug peer-relay-servers",
 				ShortHelp:  "Print the current set of candidate peer relay servers",
 				Exec:       runPeerRelayServers,
+			},
+			{
+				Name:       "test-risk",
+				ShortUsage: "tailscale debug test-risk",
+				ShortHelp:  "Do a fake risky action",
+				Exec:       runTestRisk,
+				FlagSet: (func() *flag.FlagSet {
+					fs := newFlagSet("test-risk")
+					fs.StringVar(&testRiskArgs.acceptedRisk, "accept-risk", "", "comma-separated list of accepted risks")
+					return fs
+				})(),
 			},
 		}...),
 	}
@@ -1208,7 +1219,7 @@ var debugPortmapArgs struct {
 }
 
 func debugPortmap(ctx context.Context, args []string) error {
-	opts := &tailscale.DebugPortmapOpts{
+	opts := &local.DebugPortmapOpts{
 		Duration: debugPortmapArgs.duration,
 		Type:     debugPortmapArgs.ty,
 		LogHTTP:  debugPortmapArgs.logHTTP,
@@ -1401,5 +1412,20 @@ func runPeerRelayServers(ctx context.Context, args []string) error {
 	e := json.NewEncoder(os.Stdout)
 	e.SetIndent("", "  ")
 	e.Encode(v)
+	return nil
+}
+
+var testRiskArgs struct {
+	acceptedRisk string
+}
+
+func runTestRisk(ctx context.Context, args []string) error {
+	if len(args) > 0 {
+		return errors.New("unexpected arguments")
+	}
+	if err := presentRiskToUser("test-risk", "This is a test risky action.", testRiskArgs.acceptedRisk); err != nil {
+		return err
+	}
+	fmt.Println("did-test-risky-action")
 	return nil
 }

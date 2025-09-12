@@ -168,7 +168,9 @@ type CapabilityVersion int
 //   - 121: 2025-07-19: Client understands peer relay endpoint alloc with [disco.AllocateUDPRelayEndpointRequest] & [disco.AllocateUDPRelayEndpointResponse]
 //   - 122: 2025-07-21: Client sends Hostinfo.ExitNodeID to report which exit node it has selected, if any.
 //   - 123: 2025-07-28: fix deadlock regression from cryptokey routing change (issue #16651)
-const CurrentCapabilityVersion CapabilityVersion = 123
+//   - 124: 2025-08-08: removed NodeAttrDisableMagicSockCryptoRouting support, crypto routing is now mandatory
+//   - 125: 2025-08-11: dnstype.Resolver adds UseWithExitNode field.
+const CurrentCapabilityVersion CapabilityVersion = 125
 
 // ID is an integer ID for a user, node, or login allocated by the
 // control plane.
@@ -1729,10 +1731,9 @@ type DNSConfig struct {
 	// proxying to be enabled.
 	Proxied bool `json:",omitempty"`
 
-	// The following fields are only set and used by
-	// MapRequest.Version >=9 and <14.
-
-	// Nameservers are the IP addresses of the nameservers to use.
+	// Nameservers are the IP addresses of the global nameservers to use.
+	//
+	// Deprecated: this is only set and used by MapRequest.Version >=9 and <14. Use Resolvers instead.
 	Nameservers []netip.Addr `json:",omitempty"`
 
 	// CertDomains are the set of DNS names for which the control
@@ -2404,6 +2405,9 @@ const (
 	CapabilityDebug              NodeCapability = "https://tailscale.com/cap/debug"                 // exposes debug endpoints over the PeerAPI
 	CapabilityHTTPS              NodeCapability = "https"
 
+	// CapabilityMacUIV2 makes the macOS GUI enable its v2 mode.
+	CapabilityMacUIV2 NodeCapability = "https://tailscale.com/cap/mac-ui-v2"
+
 	// CapabilityBindToInterfaceByRoute changes how Darwin nodes create
 	// sockets (in the net/netns package). See that package for more
 	// details on the behaviour of this capability.
@@ -2590,6 +2594,9 @@ const (
 
 	// NodeAttrDisableMagicSockCryptoRouting disables the use of the
 	// magicsock cryptorouting hook. See tailscale/corp#20732.
+	//
+	// Deprecated: NodeAttrDisableMagicSockCryptoRouting is deprecated as of
+	// CapabilityVersion 124, CryptoRouting is now mandatory. See tailscale/corp#31083.
 	NodeAttrDisableMagicSockCryptoRouting NodeCapability = "disable-magicsock-crypto-routing"
 
 	// NodeAttrDisableCaptivePortalDetection instructs the client to not perform captive portal detection
@@ -2649,6 +2656,14 @@ const (
 	// NodeAttrTrafficSteering configures the node to use the traffic
 	// steering subsystem for via routes. See tailscale/corp#29966.
 	NodeAttrTrafficSteering NodeCapability = "traffic-steering"
+
+	// NodeAttrTailnetDisplayName is an optional alternate name for the tailnet
+	// to be displayed to the user.
+	// If empty or absent, a default is used.
+	// If this value is present and set by a user this will only include letters,
+	// numbers, apostrophe, spaces, and hyphens. This may not be true for the default.
+	// Values can look like "foo.com" or "Foo's Test Tailnet - Staging".
+	NodeAttrTailnetDisplayName NodeCapability = "tailnet-display-name"
 )
 
 // SetDNSRequest is a request to add a DNS record.

@@ -30,6 +30,7 @@ type ConsensusIPPool struct {
 	IPSet                 *netipx.IPSet
 	perPeerMap            *syncs.Map[tailcfg.NodeID, *consensusPerPeerState]
 	consensus             commandExecutor
+	clusterController     clusterController
 	unusedAddressLifetime time.Duration
 }
 
@@ -149,16 +150,26 @@ func (ipp *ConsensusIPPool) domainLookup(from tailcfg.NodeID, addr netip.Addr) (
 	return ww, true
 }
 
+type ClusterOpts struct {
+	Tag        string
+	StateDir   string
+	FollowOnly bool
+}
+
 // StartConsensus is part of the IPPool interface. It starts the raft background routines that handle consensus.
-func (ipp *ConsensusIPPool) StartConsensus(ctx context.Context, ts *tsnet.Server, clusterTag string, clusterStateDir string) error {
+func (ipp *ConsensusIPPool) StartConsensus(ctx context.Context, ts *tsnet.Server, opts ClusterOpts) error {
 	cfg := tsconsensus.DefaultConfig()
 	cfg.ServeDebugMonitor = true
-	cfg.StateDirPath = clusterStateDir
-	cns, err := tsconsensus.Start(ctx, ts, ipp, clusterTag, cfg)
+	cfg.StateDirPath = opts.StateDir
+	cns, err := tsconsensus.Start(ctx, ts, ipp, tsconsensus.BootstrapOpts{
+		Tag:        opts.Tag,
+		FollowOnly: opts.FollowOnly,
+	}, cfg)
 	if err != nil {
 		return err
 	}
 	ipp.consensus = cns
+	ipp.clusterController = cns
 	return nil
 }
 
@@ -432,4 +443,19 @@ func (ipp *ConsensusIPPool) Apply(l *raft.Log) any {
 // used to allow a fake in the tests
 type commandExecutor interface {
 	ExecuteCommand(tsconsensus.Command) (tsconsensus.CommandResult, error)
+}
+
+type clusterController interface {
+	GetClusterConfiguration() (raft.Configuration, error)
+	DeleteClusterServer(id raft.ServerID) (uint64, error)
+}
+
+// GetClusterConfiguration gets the consensus implementation's cluster configuration
+func (ipp *ConsensusIPPool) GetClusterConfiguration() (raft.Configuration, error) {
+	return ipp.clusterController.GetClusterConfiguration()
+}
+
+// DeleteClusterServer removes a server from the consensus implementation's cluster configuration
+func (ipp *ConsensusIPPool) DeleteClusterServer(id raft.ServerID) (uint64, error) {
+	return ipp.clusterController.DeleteClusterServer(id)
 }

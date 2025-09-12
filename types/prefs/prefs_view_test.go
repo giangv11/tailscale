@@ -6,9 +6,12 @@
 package prefs
 
 import (
-	"encoding/json"
+	jsonv1 "encoding/json"
 	"errors"
 	"net/netip"
+
+	jsonv2 "github.com/go-json-experiment/json"
+	"github.com/go-json-experiment/json/jsontext"
 )
 
 //go:generate go run tailscale.com/cmd/cloner  -clonefunc=false -type=TestPrefs,TestBundle,TestValueStruct,TestGenericStruct,TestPrefsGroup -tags=test
@@ -41,8 +44,17 @@ func (v TestPrefsView) AsStruct() *TestPrefs {
 	return v.ж.Clone()
 }
 
-func (v TestPrefsView) MarshalJSON() ([]byte, error) { return json.Marshal(v.ж) }
+// MarshalJSON implements [jsonv1.Marshaler].
+func (v TestPrefsView) MarshalJSON() ([]byte, error) {
+	return jsonv1.Marshal(v.ж)
+}
 
+// MarshalJSONTo implements [jsonv2.MarshalerTo].
+func (v TestPrefsView) MarshalJSONTo(enc *jsontext.Encoder) error {
+	return jsonv2.MarshalEncode(enc, v.ж)
+}
+
+// UnmarshalJSON implements [jsonv1.Unmarshaler].
 func (v *TestPrefsView) UnmarshalJSON(b []byte) error {
 	if v.ж != nil {
 		return errors.New("already initialized")
@@ -51,7 +63,20 @@ func (v *TestPrefsView) UnmarshalJSON(b []byte) error {
 		return nil
 	}
 	var x TestPrefs
-	if err := json.Unmarshal(b, &x); err != nil {
+	if err := jsonv1.Unmarshal(b, &x); err != nil {
+		return err
+	}
+	v.ж = &x
+	return nil
+}
+
+// UnmarshalJSONFrom implements [jsonv2.UnmarshalerFrom].
+func (v *TestPrefsView) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	if v.ж != nil {
+		return errors.New("already initialized")
+	}
+	var x TestPrefs
+	if err := jsonv2.UnmarshalDecode(dec, &x); err != nil {
 		return err
 	}
 	v.ж = &x
@@ -70,6 +95,9 @@ func (v TestPrefsView) AddrItem() Item[netip.Addr]               { return v.ж.A
 func (v TestPrefsView) StringStringMap() MapView[string, string] { return v.ж.StringStringMap.View() }
 func (v TestPrefsView) IntStringMap() MapView[int, string]       { return v.ж.IntStringMap.View() }
 func (v TestPrefsView) AddrIntMap() MapView[netip.Addr, int]     { return v.ж.AddrIntMap.View() }
+
+// Bundles are complex preferences that usually consist of
+// multiple parameters that must be configured atomically.
 func (v TestPrefsView) Bundle1() ItemView[*TestBundle, TestBundleView] {
 	return ItemViewOf(&v.ж.Bundle1)
 }
@@ -91,6 +119,10 @@ func (v TestPrefsView) IntBundleMap() StructMapView[int, *TestBundle, TestBundle
 func (v TestPrefsView) AddrBundleMap() StructMapView[netip.Addr, *TestBundle, TestBundleView] {
 	return StructMapViewOf(&v.ж.AddrBundleMap)
 }
+
+// Group is a nested struct that contains one or more preferences.
+// Each preference in a group can be configured individually.
+// Preference groups should be included directly rather than by pointers.
 func (v TestPrefsView) Group() TestPrefsGroup { return v.ж.Group }
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
@@ -145,8 +177,17 @@ func (v TestBundleView) AsStruct() *TestBundle {
 	return v.ж.Clone()
 }
 
-func (v TestBundleView) MarshalJSON() ([]byte, error) { return json.Marshal(v.ж) }
+// MarshalJSON implements [jsonv1.Marshaler].
+func (v TestBundleView) MarshalJSON() ([]byte, error) {
+	return jsonv1.Marshal(v.ж)
+}
 
+// MarshalJSONTo implements [jsonv2.MarshalerTo].
+func (v TestBundleView) MarshalJSONTo(enc *jsontext.Encoder) error {
+	return jsonv2.MarshalEncode(enc, v.ж)
+}
+
+// UnmarshalJSON implements [jsonv1.Unmarshaler].
 func (v *TestBundleView) UnmarshalJSON(b []byte) error {
 	if v.ж != nil {
 		return errors.New("already initialized")
@@ -155,7 +196,20 @@ func (v *TestBundleView) UnmarshalJSON(b []byte) error {
 		return nil
 	}
 	var x TestBundle
-	if err := json.Unmarshal(b, &x); err != nil {
+	if err := jsonv1.Unmarshal(b, &x); err != nil {
+		return err
+	}
+	v.ж = &x
+	return nil
+}
+
+// UnmarshalJSONFrom implements [jsonv2.UnmarshalerFrom].
+func (v *TestBundleView) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	if v.ж != nil {
+		return errors.New("already initialized")
+	}
+	var x TestBundle
+	if err := jsonv2.UnmarshalDecode(dec, &x); err != nil {
 		return err
 	}
 	v.ж = &x
@@ -200,8 +254,17 @@ func (v TestValueStructView) AsStruct() *TestValueStruct {
 	return v.ж.Clone()
 }
 
-func (v TestValueStructView) MarshalJSON() ([]byte, error) { return json.Marshal(v.ж) }
+// MarshalJSON implements [jsonv1.Marshaler].
+func (v TestValueStructView) MarshalJSON() ([]byte, error) {
+	return jsonv1.Marshal(v.ж)
+}
 
+// MarshalJSONTo implements [jsonv2.MarshalerTo].
+func (v TestValueStructView) MarshalJSONTo(enc *jsontext.Encoder) error {
+	return jsonv2.MarshalEncode(enc, v.ж)
+}
+
+// UnmarshalJSON implements [jsonv1.Unmarshaler].
 func (v *TestValueStructView) UnmarshalJSON(b []byte) error {
 	if v.ж != nil {
 		return errors.New("already initialized")
@@ -210,7 +273,20 @@ func (v *TestValueStructView) UnmarshalJSON(b []byte) error {
 		return nil
 	}
 	var x TestValueStruct
-	if err := json.Unmarshal(b, &x); err != nil {
+	if err := jsonv1.Unmarshal(b, &x); err != nil {
+		return err
+	}
+	v.ж = &x
+	return nil
+}
+
+// UnmarshalJSONFrom implements [jsonv2.UnmarshalerFrom].
+func (v *TestValueStructView) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	if v.ж != nil {
+		return errors.New("already initialized")
+	}
+	var x TestValueStruct
+	if err := jsonv2.UnmarshalDecode(dec, &x); err != nil {
 		return err
 	}
 	v.ж = &x
@@ -253,8 +329,17 @@ func (v TestGenericStructView[T]) AsStruct() *TestGenericStruct[T] {
 	return v.ж.Clone()
 }
 
-func (v TestGenericStructView[T]) MarshalJSON() ([]byte, error) { return json.Marshal(v.ж) }
+// MarshalJSON implements [jsonv1.Marshaler].
+func (v TestGenericStructView[T]) MarshalJSON() ([]byte, error) {
+	return jsonv1.Marshal(v.ж)
+}
 
+// MarshalJSONTo implements [jsonv2.MarshalerTo].
+func (v TestGenericStructView[T]) MarshalJSONTo(enc *jsontext.Encoder) error {
+	return jsonv2.MarshalEncode(enc, v.ж)
+}
+
+// UnmarshalJSON implements [jsonv1.Unmarshaler].
 func (v *TestGenericStructView[T]) UnmarshalJSON(b []byte) error {
 	if v.ж != nil {
 		return errors.New("already initialized")
@@ -263,7 +348,20 @@ func (v *TestGenericStructView[T]) UnmarshalJSON(b []byte) error {
 		return nil
 	}
 	var x TestGenericStruct[T]
-	if err := json.Unmarshal(b, &x); err != nil {
+	if err := jsonv1.Unmarshal(b, &x); err != nil {
+		return err
+	}
+	v.ж = &x
+	return nil
+}
+
+// UnmarshalJSONFrom implements [jsonv2.UnmarshalerFrom].
+func (v *TestGenericStructView[T]) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	if v.ж != nil {
+		return errors.New("already initialized")
+	}
+	var x TestGenericStruct[T]
+	if err := jsonv2.UnmarshalDecode(dec, &x); err != nil {
 		return err
 	}
 	v.ж = &x
@@ -308,8 +406,17 @@ func (v TestPrefsGroupView) AsStruct() *TestPrefsGroup {
 	return v.ж.Clone()
 }
 
-func (v TestPrefsGroupView) MarshalJSON() ([]byte, error) { return json.Marshal(v.ж) }
+// MarshalJSON implements [jsonv1.Marshaler].
+func (v TestPrefsGroupView) MarshalJSON() ([]byte, error) {
+	return jsonv1.Marshal(v.ж)
+}
 
+// MarshalJSONTo implements [jsonv2.MarshalerTo].
+func (v TestPrefsGroupView) MarshalJSONTo(enc *jsontext.Encoder) error {
+	return jsonv2.MarshalEncode(enc, v.ж)
+}
+
+// UnmarshalJSON implements [jsonv1.Unmarshaler].
 func (v *TestPrefsGroupView) UnmarshalJSON(b []byte) error {
 	if v.ж != nil {
 		return errors.New("already initialized")
@@ -318,7 +425,20 @@ func (v *TestPrefsGroupView) UnmarshalJSON(b []byte) error {
 		return nil
 	}
 	var x TestPrefsGroup
-	if err := json.Unmarshal(b, &x); err != nil {
+	if err := jsonv1.Unmarshal(b, &x); err != nil {
+		return err
+	}
+	v.ж = &x
+	return nil
+}
+
+// UnmarshalJSONFrom implements [jsonv2.UnmarshalerFrom].
+func (v *TestPrefsGroupView) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	if v.ж != nil {
+		return errors.New("already initialized")
+	}
+	var x TestPrefsGroup
+	if err := jsonv2.UnmarshalDecode(dec, &x); err != nil {
 		return err
 	}
 	v.ж = &x

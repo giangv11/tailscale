@@ -58,8 +58,6 @@ import (
 	"tailscale.com/util/mak"
 	"tailscale.com/util/osdiag"
 	"tailscale.com/util/rands"
-	"tailscale.com/util/syspolicy/rsop"
-	"tailscale.com/util/syspolicy/setting"
 	"tailscale.com/version"
 	"tailscale.com/wgengine/magicsock"
 )
@@ -79,7 +77,6 @@ type LocalAPIHandler func(*Handler, http.ResponseWriter, *http.Request)
 var handler = map[string]LocalAPIHandler{
 	// The prefix match handlers end with a slash:
 	"cert/":     (*Handler).serveCert,
-	"policy/":   (*Handler).servePolicy,
 	"profiles/": (*Handler).serveProfiles,
 
 	// The other /localapi/v0/NAME handlers are exact matches and contain only NAME
@@ -172,9 +169,26 @@ var (
 	metrics   = map[string]*clientmetric.Metric{}
 )
 
-// NewHandler creates a new LocalAPI HTTP handler. All parameters are required.
-func NewHandler(actor ipnauth.Actor, b *ipnlocal.LocalBackend, logf logger.Logf, logID logid.PublicID) *Handler {
-	return &Handler{Actor: actor, b: b, logf: logf, backendLogID: logID, clock: tstime.StdClock{}}
+// NewHandler creates a new LocalAPI HTTP handler from the given config.
+func NewHandler(cfg HandlerConfig) *Handler {
+	return &Handler{
+		Actor:        cfg.Actor,
+		b:            cfg.Backend,
+		logf:         cfg.Logf,
+		backendLogID: cfg.LogID,
+		clock:        tstime.StdClock{},
+		eventBus:     cfg.EventBus,
+	}
+}
+
+// HandlerConfig carries the settings for a local API handler.
+// All fields are required.
+type HandlerConfig struct {
+	Actor    ipnauth.Actor
+	Backend  *ipnlocal.LocalBackend
+	Logf     logger.Logf
+	LogID    logid.PublicID
+	EventBus *eventbus.Bus
 }
 
 type Handler struct {
@@ -203,6 +217,7 @@ type Handler struct {
 	logf         logger.Logf
 	backendLogID logid.PublicID
 	clock        tstime.Clock
+	eventBus     *eventbus.Bus // read-only after initialization
 }
 
 func (h *Handler) Logf(format string, args ...any) {
@@ -850,6 +865,7 @@ func (h *Handler) serveDebugPortmap(w http.ResponseWriter, r *http.Request) {
 		NetMon:       h.b.NetMon(),
 		DebugKnobs:   debugKnobs,
 		ControlKnobs: h.b.ControlKnobs(),
+		EventBus:     h.eventBus,
 		OnChange: func() {
 			logf("portmapping changed.")
 			logf("have mapping: %v", c.HaveMapping())
@@ -1582,53 +1598,6 @@ func (h *Handler) servePrefs(w http.ResponseWriter, r *http.Request) {
 	e := json.NewEncoder(w)
 	e.SetIndent("", "\t")
 	e.Encode(prefs)
-}
-
-func (h *Handler) servePolicy(w http.ResponseWriter, r *http.Request) {
-	if !h.PermitRead {
-		http.Error(w, "policy access denied", http.StatusForbidden)
-		return
-	}
-
-	suffix, ok := strings.CutPrefix(r.URL.EscapedPath(), "/localapi/v0/policy/")
-	if !ok {
-		http.Error(w, "misconfigured", http.StatusInternalServerError)
-		return
-	}
-
-	var scope setting.PolicyScope
-	if suffix == "" {
-		scope = setting.DefaultScope()
-	} else if err := scope.UnmarshalText([]byte(suffix)); err != nil {
-		http.Error(w, fmt.Sprintf("%q is not a valid scope", suffix), http.StatusBadRequest)
-		return
-	}
-
-	policy, err := rsop.PolicyFor(scope)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	var effectivePolicy *setting.Snapshot
-	switch r.Method {
-	case httpm.GET:
-		effectivePolicy = policy.Get()
-	case httpm.POST:
-		effectivePolicy, err = policy.Reload()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	default:
-		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	e := json.NewEncoder(w)
-	e.SetIndent("", "\t")
-	e.Encode(effectivePolicy)
 }
 
 type resJSON struct {

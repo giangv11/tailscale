@@ -27,7 +27,6 @@ import (
 	"time"
 
 	"tailscale.com/client/local"
-	"tailscale.com/client/tailscale"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
@@ -123,6 +122,12 @@ type Server struct {
 	// traffic. If zero, a port is automatically selected. Leave this
 	// field at zero unless you know what you are doing.
 	Port uint16
+
+	// AdvertiseTags specifies tags that should be applied to this node, for
+	// purposes of ACL enforcement. These can be referenced from the ACL policy
+	// document. Note that advertising a tag on the client doesn't guarantee
+	// that the control server will allow the node to adopt that tag.
+	AdvertiseTags []string
 
 	getCertForTesting func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 
@@ -274,7 +279,13 @@ func (s *Server) Loopback() (addr string, proxyCred, localAPICred string, err er
 		// out the CONNECT code from tailscaled/proxy.go that uses
 		// httputil.ReverseProxy and adding auth support.
 		go func() {
-			lah := localapi.NewHandler(ipnauth.Self, s.lb, s.logf, s.logid)
+			lah := localapi.NewHandler(localapi.HandlerConfig{
+				Actor:    ipnauth.Self,
+				Backend:  s.lb,
+				Logf:     s.logf,
+				LogID:    s.logid,
+				EventBus: s.sys.Bus.Get(),
+			})
 			lah.PermitWrite = true
 			lah.PermitRead = true
 			lah.RequiredPassword = s.localAPICred
@@ -435,10 +446,7 @@ func (s *Server) Close() error {
 		ln.closeLocked()
 	}
 	wg.Wait()
-
-	if bus := s.sys.Bus.Get(); bus != nil {
-		bus.Close()
-	}
+	s.sys.Bus.Get().Close()
 	s.closed = true
 	return nil
 }
@@ -659,6 +667,7 @@ func (s *Server) start() (reterr error) {
 	prefs.WantRunning = true
 	prefs.ControlURL = s.ControlURL
 	prefs.RunWebClient = s.RunWebClient
+	prefs.AdvertiseTags = s.AdvertiseTags
 	authKey := s.getAuthKey()
 	err = lb.Start(ipn.Options{
 		UpdatePrefs: prefs,
@@ -679,7 +688,13 @@ func (s *Server) start() (reterr error) {
 	go s.printAuthURLLoop()
 
 	// Run the localapi handler, to allow fetching LetsEncrypt certs.
-	lah := localapi.NewHandler(ipnauth.Self, lb, tsLogf, s.logid)
+	lah := localapi.NewHandler(localapi.HandlerConfig{
+		Actor:    ipnauth.Self,
+		Backend:  lb,
+		Logf:     tsLogf,
+		LogID:    s.logid,
+		EventBus: sys.Bus.Get(),
+	})
 	lah.PermitWrite = true
 	lah.PermitRead = true
 
@@ -892,25 +907,6 @@ func (s *Server) getUDPHandlerForFlow(src, dst netip.AddrPort) (handler func(net
 		return nil, true // don't handle, don't forward to localhost
 	}
 	return func(c nettype.ConnPacketConn) { ln.handle(c) }, true
-}
-
-// APIClient returns a tailscale.Client that can be used to make authenticated
-// requests to the Tailscale control server.
-// It requires the user to set tailscale.I_Acknowledge_This_API_Is_Unstable.
-//
-// Deprecated: use AuthenticatedAPITransport with tailscale.com/client/tailscale/v2 instead.
-func (s *Server) APIClient() (*tailscale.Client, error) {
-	if !tailscale.I_Acknowledge_This_API_Is_Unstable {
-		return nil, errors.New("use of Client without setting I_Acknowledge_This_API_Is_Unstable")
-	}
-	if err := s.Start(); err != nil {
-		return nil, err
-	}
-
-	c := tailscale.NewClient("-", nil)
-	c.UserAgent = "tailscale-tsnet"
-	c.HTTPClient = &http.Client{Transport: s.lb.KeyProvingNoiseRoundTripper()}
-	return c, nil
 }
 
 // I_Acknowledge_This_API_Is_Experimental must be set true to use AuthenticatedAPITransport()
@@ -1269,6 +1265,12 @@ func (s *Server) listen(network, addr string, lnOn listenOn) (net.Listener, erro
 	}
 	s.mu.Unlock()
 	return ln, nil
+}
+
+// GetRootPath returns the root path of the tsnet server.
+// This is where the state file and other data is stored.
+func (s *Server) GetRootPath() string {
+	return s.rootPath
 }
 
 // CapturePcap can be called by the application code compiled with tsnet to save a pcap

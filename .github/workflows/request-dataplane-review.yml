@@ -8,6 +8,7 @@ on:
       - ".github/workflows/request-dataplane-review.yml"
       - "**/*derp*"
       - "**/derp*/**"
+      - "!**/depaware.txt"
 
 jobs:
   request-dataplane-review:

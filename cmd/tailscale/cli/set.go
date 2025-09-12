@@ -15,13 +15,13 @@ import (
 	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
-	"tailscale.com/client/web"
 	"tailscale.com/clientupdate"
 	"tailscale.com/cmd/tailscale/cli/ffcomplete"
 	"tailscale.com/ipn"
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/safesocket"
+	"tailscale.com/tsconst"
 	"tailscale.com/types/opt"
 	"tailscale.com/types/ptr"
 	"tailscale.com/types/views"
@@ -185,7 +185,7 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 		}
 	}
 
-	warnOnAdvertiseRouts(ctx, &maskedPrefs.Prefs)
+	warnOnAdvertiseRoutes(ctx, &maskedPrefs.Prefs)
 	if err := checkExitNodeRisk(ctx, &maskedPrefs.Prefs, setArgs.acceptedRisks); err != nil {
 		return err
 	}
@@ -264,7 +264,7 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 	}
 
 	if setArgs.runWebClient && len(st.TailscaleIPs) > 0 {
-		printf("\nWeb interface now running at %s:%d", st.TailscaleIPs[0], web.ListenPort)
+		printf("\nWeb interface now running at %s:%d\n", st.TailscaleIPs[0], tsconst.WebListenPort)
 	}
 
 	return nil

@@ -8,8 +8,9 @@ PLATFORM ?= "flyio" ## flyio==linux/amd64. Set to "" to build all platforms.
 vet: ## Run go vet
 	./tool/go vet ./...
 
-tidy: ## Run go mod tidy
+tidy: ## Run go mod tidy and update nix flake hashes
 	./tool/go mod tidy
+	./update-flake.sh
 
 lint: ## Run golangci-lint
 	./tool/go run github.com/golangci/golangci-lint/cmd/golangci-lint run
@@ -133,9 +134,19 @@ sshintegrationtest: ## Run the SSH integration tests in various Docker container
 	echo "Testing on ubuntu:noble" && docker build --build-arg="BASE=ubuntu:noble" -t ssh-ubuntu-noble ssh/tailssh/testcontainers && \
 	echo "Testing on alpine:latest" && docker build --build-arg="BASE=alpine:latest" -t ssh-alpine-latest ssh/tailssh/testcontainers
 
+.PHONY: generate
+generate: ## Generate code
+	./tool/go generate ./...
+
+.PHONY: pin-github-actions
+pin-github-actions:
+	./tool/go tool github.com/stacklok/frizbee actions .github/workflows
+
 help: ## Show this help
-	@echo "\nSpecify a command. The choices are:\n"
-	@grep -hE '^[0-9a-zA-Z_-]+:.*?## .*$$' ${MAKEFILE_LIST} | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[0;36m%-20s\033[m %s\n", $$1, $$2}'
+	@echo ""
+	@echo "Specify a command. The choices are:"
+	@echo ""
+	@grep -hE '^[0-9a-zA-Z_-]+:.*?## .*$$' ${MAKEFILE_LIST} | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[0;36m%-20s\033[m %s\n", $$1, $$2}'
 	@echo ""
 .PHONY: help
 

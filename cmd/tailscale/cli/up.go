@@ -39,6 +39,7 @@ import (
 	"tailscale.com/types/preftype"
 	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/util/syspolicy/policyclient"
 	"tailscale.com/version/distro"
 )
 
@@ -485,7 +486,7 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 		fatalf("%s", err)
 	}
 
-	warnOnAdvertiseRouts(ctx, prefs)
+	warnOnAdvertiseRoutes(ctx, prefs)
 	if err := checkExitNodeRisk(ctx, prefs, upArgs.acceptedRisks); err != nil {
 		return err
 	}
@@ -609,7 +610,7 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 					if env.upArgs.json {
 						printUpDoneJSON(ipn.NeedsMachineAuth, "")
 					} else {
-						fmt.Fprintf(Stderr, "\nTo approve your machine, visit (as admin):\n\n\t%s\n\n", prefs.AdminPageURL())
+						fmt.Fprintf(Stderr, "\nTo approve your machine, visit (as admin):\n\n\t%s\n\n", prefs.AdminPageURL(policyclient.Get()))
 					}
 				case ipn.Running:
 					// Done full authentication process
@@ -1183,7 +1184,7 @@ func resolveAuthKey(ctx context.Context, v, tags string) (string, error) {
 	return authkey, nil
 }
 
-func warnOnAdvertiseRouts(ctx context.Context, prefs *ipn.Prefs) {
+func warnOnAdvertiseRoutes(ctx context.Context, prefs *ipn.Prefs) {
 	if len(prefs.AdvertiseRoutes) > 0 || prefs.AppConnector.Advertise {
 		// TODO(jwhited): compress CheckIPForwarding and CheckUDPGROForwarding
 		//  into a single HTTP req.

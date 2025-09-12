@@ -48,7 +48,12 @@ var (
 )
 
 // Run starts the systray menu and blocks until the menu exits.
-func (menu *Menu) Run() {
+// If client is nil, a default local.Client is used.
+func (menu *Menu) Run(client *local.Client) {
+	if client == nil {
+		client = &local.Client{}
+	}
+	menu.lc = client
 	menu.updateState()
 
 	// exit cleanly on SIGINT and SIGTERM
@@ -71,7 +76,7 @@ func (menu *Menu) Run() {
 type Menu struct {
 	mu sync.Mutex // protects the entire Menu
 
-	lc          local.Client
+	lc          *local.Client
 	status      *ipnstate.Status
 	curProfile  ipn.LoginProfile
 	allProfiles []ipn.LoginProfile
@@ -155,6 +160,17 @@ func (menu *Menu) onReady() {
 	log.Printf("starting")
 	setAppIcon(disconnected)
 	menu.rebuild()
+
+	menu.mu.Lock()
+	if menu.readonly {
+		fmt.Fprintln(os.Stderr, `
+No permission to manage Tailscale. Set operator by running:
+
+sudo tailscale set --operator=$USER
+
+See https://tailscale.com/s/cli-operator for more information.`)
+	}
+	menu.mu.Unlock()
 }
 
 // updateState updates the Menu state from the Tailscale local client.
@@ -290,11 +306,14 @@ func (menu *Menu) rebuild() {
 		menu.rebuildExitNodeMenu(ctx)
 	}
 
-	if menu.status != nil {
-		menu.more = systray.AddMenuItem("More settings", "")
+	menu.more = systray.AddMenuItem("More settings", "")
+	if menu.status != nil && menu.status.BackendState == "Running" {
+		// web client is only available if backend is running
 		onClick(ctx, menu.more, func(_ context.Context) {
 			webbrowser.Open("http://100.100.100.100/")
 		})
+	} else {
+		menu.more.Disable()
 	}
 
 	// TODO(#15528): this menu item shouldn't be necessary at all,

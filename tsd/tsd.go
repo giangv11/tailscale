@@ -33,6 +33,7 @@ import (
 	"tailscale.com/proxymap"
 	"tailscale.com/types/netmap"
 	"tailscale.com/util/eventbus"
+	"tailscale.com/util/syspolicy/policyclient"
 	"tailscale.com/util/usermetric"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/magicsock"
@@ -58,6 +59,7 @@ type System struct {
 	Netstack       SubSystem[NetstackImpl] // actually a *netstack.Impl
 	DriveForLocal  SubSystem[drive.FileSystemForLocal]
 	DriveForRemote SubSystem[drive.FileSystemForRemote]
+	PolicyClient   SubSystem[policyclient.Client]
 
 	// InitialConfig is initial server config, if any.
 	// It is nil if the node is not in declarative mode.
@@ -126,6 +128,8 @@ func (s *System) Set(v any) {
 		s.DriveForLocal.Set(v)
 	case drive.FileSystemForRemote:
 		s.DriveForRemote.Set(v)
+	case policyclient.Client:
+		s.PolicyClient.Set(v)
 	default:
 		panic(fmt.Sprintf("unknown type %T", v))
 	}
@@ -163,6 +167,15 @@ func (s *System) HealthTracker() *health.Tracker {
 // UserMetricsRegistry returns the system usermetrics.
 func (s *System) UserMetricsRegistry() *usermetric.Registry {
 	return &s.userMetricsRegistry
+}
+
+// PolicyClientOrDefault returns the policy client if set or a no-op default
+// otherwise. It always returns a non-nil value.
+func (s *System) PolicyClientOrDefault() policyclient.Client {
+	if client, ok := s.PolicyClient.GetOK(); ok {
+		return client
+	}
+	return policyclient.Get()
 }
 
 // SubSystem represents some subsystem of the Tailscale node daemon.
