@@ -16,6 +16,7 @@ import (
 
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
+	"tailscale.com/derp/derpserver"
 	"tailscale.com/net/netmon"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -74,7 +75,7 @@ func TestDerpProber(t *testing.T) {
 		p:              p,
 		derpMapURL:     srv.URL,
 		tlsInterval:    time.Second,
-		tlsProbeFn:     func(_ string) ProbeClass { return FuncProbe(func(context.Context) error { return nil }) },
+		tlsProbeFn:     func(_ string, _ *tls.Config) ProbeClass { return FuncProbe(func(context.Context) error { return nil }) },
 		udpInterval:    time.Second,
 		udpProbeFn:     func(_ string, _ int) ProbeClass { return FuncProbe(func(context.Context) error { return nil }) },
 		meshInterval:   time.Second,
@@ -145,12 +146,12 @@ func TestDerpProber(t *testing.T) {
 func TestRunDerpProbeNodePair(t *testing.T) {
 	// os.Setenv("DERP_DEBUG_LOGS", "true")
 	serverPrivateKey := key.NewNode()
-	s := derp.NewServer(serverPrivateKey, t.Logf)
+	s := derpserver.New(serverPrivateKey, t.Logf)
 	defer s.Close()
 
 	httpsrv := &http.Server{
 		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
-		Handler:      derphttp.Handler(s),
+		Handler:      derpserver.Handler(s),
 	}
 	ln, err := net.Listen("tcp4", "localhost:0")
 	if err != nil {

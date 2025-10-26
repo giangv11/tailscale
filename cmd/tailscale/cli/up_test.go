@@ -35,6 +35,7 @@ var validUpFlags = set.Of(
 	"operator",
 	"report-posture",
 	"qr",
+	"qr-format",
 	"reset",
 	"shields-up",
 	"snat-subnet-routes",
@@ -42,6 +43,9 @@ var validUpFlags = set.Of(
 	"stateful-filtering",
 	"timeout",
 	"unattended",
+	"client-id",
+	"client-secret",
+	"id-token",
 )
 
 // TestUpFlagSetIsFrozen complains when new flags are added to tailscale up.

@@ -15,8 +15,8 @@ import (
 	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
-	"tailscale.com/clientupdate"
 	"tailscale.com/cmd/tailscale/cli/ffcomplete"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/ipn"
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/tsaddr"
@@ -85,7 +85,7 @@ func newSetFlagSet(goos string, setArgs *setArgsT) *flag.FlagSet {
 	setf.BoolVar(&setArgs.updateApply, "auto-update", false, "automatically update to the latest available version")
 	setf.BoolVar(&setArgs.reportPosture, "report-posture", false, "allow management plane to gather device posture information")
 	setf.BoolVar(&setArgs.runWebClient, "webclient", false, "expose the web interface for managing this node over Tailscale at port 5252")
-	setf.StringVar(&setArgs.relayServerPort, "relay-server-port", "", hidden+"UDP port number (0 will pick a random unused port) for the relay server to bind to, on all interfaces, or empty string to disable relay server functionality")
+	setf.StringVar(&setArgs.relayServerPort, "relay-server-port", "", "UDP port number (0 will pick a random unused port) for the relay server to bind to, on all interfaces, or empty string to disable relay server functionality")
 
 	ffcomplete.Flag(setf, "exit-node", func(args []string) ([]string, ffcomplete.ShellCompDirective, error) {
 		st, err := localClient.Status(context.Background())
@@ -226,21 +226,14 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 			return err
 		}
 	}
-	if maskedPrefs.AutoUpdateSet.ApplySet {
-		if !clientupdate.CanAutoUpdate() {
-			return errors.New("automatic updates are not supported on this platform")
+	if maskedPrefs.AutoUpdateSet.ApplySet && buildfeatures.HasClientUpdate && version.IsMacSysExt() {
+		apply := "0"
+		if maskedPrefs.AutoUpdate.Apply.EqualBool(true) {
+			apply = "1"
 		}
-		// On macsys, tailscaled will set the Sparkle auto-update setting. It
-		// does not use clientupdate.
-		if version.IsMacSysExt() {
-			apply := "0"
-			if maskedPrefs.AutoUpdate.Apply.EqualBool(true) {
-				apply = "1"
-			}
-			out, err := exec.Command("defaults", "write", "io.tailscale.ipn.macsys", "SUAutomaticallyUpdate", apply).CombinedOutput()
-			if err != nil {
-				return fmt.Errorf("failed to enable automatic updates: %v, %q", err, out)
-			}
+		out, err := exec.Command("defaults", "write", "io.tailscale.ipn.macsys", "SUAutomaticallyUpdate", apply).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to enable automatic updates: %v, %q", err, out)
 		}
 	}
 

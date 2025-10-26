@@ -339,9 +339,9 @@ func profileTitle(profile ipn.LoginProfile) string {
 	if profile.NetworkProfile.DomainName != "" {
 		if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
 			// windows and mac don't support multi-line menu
-			title += " (" + profile.NetworkProfile.DomainName + ")"
+			title += " (" + profile.NetworkProfile.DisplayNameOrDefault() + ")"
 		} else {
-			title += "\n" + profile.NetworkProfile.DomainName
+			title += "\n" + profile.NetworkProfile.DisplayNameOrDefault()
 		}
 	}
 	return title
@@ -540,9 +540,9 @@ func (menu *Menu) copyTailscaleIP(device *ipnstate.PeerStatus) {
 	err := clipboard.WriteAll(ip)
 	if err != nil {
 		log.Printf("clipboard error: %v", err)
+	} else {
+		menu.sendNotification(fmt.Sprintf("Copied Address for %v", name), ip)
 	}
-
-	menu.sendNotification(fmt.Sprintf("Copied Address for %v", name), ip)
 }
 
 // sendNotification sends a desktop notification with the given title and content.

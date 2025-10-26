@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net/netip"
 	"strings"
 	"sync"
@@ -39,6 +40,7 @@ import (
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/must"
 	"tailscale.com/wgengine"
@@ -57,8 +59,9 @@ type notifyThrottler struct {
 
 	// ch gets replaced frequently. Lock the mutex before getting or
 	// setting it, but not while waiting on it.
-	mu sync.Mutex
-	ch chan ipn.Notify
+	mu     sync.Mutex
+	ch     chan ipn.Notify
+	putErr error // set by put if the channel is full
 }
 
 // expect tells the throttler to expect count upcoming notifications.
@@ -79,7 +82,11 @@ func (nt *notifyThrottler) put(n ipn.Notify) {
 	case ch <- n:
 		return
 	default:
-		nt.t.Fatalf("put: channel full: %v", n)
+		err := fmt.Errorf("put: channel full: %v", n)
+		nt.t.Log(err)
+		nt.mu.Lock()
+		nt.putErr = err
+		nt.mu.Unlock()
 	}
 }
 
@@ -89,7 +96,12 @@ func (nt *notifyThrottler) drain(count int) []ipn.Notify {
 	nt.t.Helper()
 	nt.mu.Lock()
 	ch := nt.ch
+	putErr := nt.putErr
 	nt.mu.Unlock()
+
+	if putErr != nil {
+		nt.t.Fatalf("drain: previous call to put errored: %s", putErr)
+	}
 
 	nn := []ipn.Notify{}
 	for i := range count {
@@ -113,10 +125,11 @@ func (nt *notifyThrottler) drain(count int) []ipn.Notify {
 // in the controlclient.Client, so by controlling it, we can check that
 // the state machine works as expected.
 type mockControl struct {
-	tb     testing.TB
-	logf   logger.Logf
-	opts   controlclient.Options
-	paused atomic.Bool
+	tb              testing.TB
+	logf            logger.Logf
+	opts            controlclient.Options
+	paused          atomic.Bool
+	controlClientID int64
 
 	mu          sync.Mutex
 	persist     *persist.Persist
@@ -127,12 +140,13 @@ type mockControl struct {
 
 func newClient(tb testing.TB, opts controlclient.Options) *mockControl {
 	return &mockControl{
-		tb:          tb,
-		authBlocked: true,
-		logf:        opts.Logf,
-		opts:        opts,
-		shutdown:    make(chan struct{}),
-		persist:     opts.Persist.Clone(),
+		tb:              tb,
+		authBlocked:     true,
+		logf:            opts.Logf,
+		opts:            opts,
+		shutdown:        make(chan struct{}),
+		persist:         opts.Persist.Clone(),
+		controlClientID: rand.Int64(),
 	}
 }
 
@@ -168,9 +182,17 @@ func (cc *mockControl) populateKeys() (newKeys bool) {
 	return newKeys
 }
 
+type sendOpt struct {
+	err           error
+	url           string
+	loginFinished bool
+	nm            *netmap.NetworkMap
+}
+
 // send publishes a controlclient.Status notification upstream.
 // (In our tests here, upstream is the ipnlocal.Local instance.)
-func (cc *mockControl) send(err error, url string, loginFinished bool, nm *netmap.NetworkMap) {
+func (cc *mockControl) send(opts sendOpt) {
+	err, url, loginFinished, nm := opts.err, opts.url, opts.loginFinished, opts.nm
 	if loginFinished {
 		cc.mu.Lock()
 		cc.authBlocked = false
@@ -197,7 +219,17 @@ func (cc *mockControl) authenticated(nm *netmap.NetworkMap) {
 		cc.persist.UserProfile = *selfUser.AsStruct()
 	}
 	cc.persist.NodeID = nm.SelfNode.StableID()
-	cc.send(nil, "", true, nm)
+	cc.send(sendOpt{loginFinished: true, nm: nm})
+}
+
+func (cc *mockControl) sendAuthURL(nm *netmap.NetworkMap) {
+	s := controlclient.Status{
+		URL:     "https://example.com/a/foo",
+		NetMap:  nm,
+		Persist: cc.persist.View(),
+	}
+	s.SetStateForTest(controlclient.StateURLVisitRequired)
+	cc.opts.Observer.SetControlClientStatus(cc, s)
 }
 
 // called records that a particular function name was called.
@@ -287,6 +319,10 @@ func (cc *mockControl) UpdateEndpoints(endpoints []tailcfg.Endpoint) {
 	cc.called("UpdateEndpoints")
 }
 
+func (cc *mockControl) ClientID() int64 {
+	return cc.controlClientID
+}
+
 func (b *LocalBackend) nonInteractiveLoginForStateTest() {
 	b.mu.Lock()
 	if b.cc == nil {
@@ -320,6 +356,14 @@ func (b *LocalBackend) nonInteractiveLoginForStateTest() {
 // predictable, but maybe a bit less thorough. This is more of an overall
 // state machine test than a test of the wgengine+magicsock integration.
 func TestStateMachine(t *testing.T) {
+	runTestStateMachine(t, false)
+}
+
+func TestStateMachineSeamless(t *testing.T) {
+	runTestStateMachine(t, true)
+}
+
+func runTestStateMachine(t *testing.T, seamless bool) {
 	envknob.Setenv("TAILSCALE_USE_WIP_CODE", "1")
 	defer envknob.Setenv("TAILSCALE_USE_WIP_CODE", "")
 	c := qt.New(t)
@@ -328,7 +372,7 @@ func TestStateMachine(t *testing.T) {
 	sys := tsd.NewSystem()
 	store := new(testStateStorage)
 	sys.Set(store)
-	e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry(), sys.Bus.Get())
+	e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker.Get(), sys.UserMetricsRegistry(), sys.Bus.Get())
 	if err != nil {
 		t.Fatalf("NewFakeUserspaceEngine: %v", err)
 	}
@@ -340,7 +384,6 @@ func TestStateMachine(t *testing.T) {
 		t.Fatalf("NewLocalBackend: %v", err)
 	}
 	t.Cleanup(b.Shutdown)
-	b.DisablePortMapperForTest()
 
 	var cc, previousCC *mockControl
 	b.SetControlClientGetterForTesting(func(opts controlclient.Options) (controlclient.Client, error) {
@@ -445,7 +488,7 @@ func TestStateMachine(t *testing.T) {
 		},
 	})
 	url1 := "https://localhost:1/1"
-	cc.send(nil, url1, false, nil)
+	cc.send(sendOpt{url: url1})
 	{
 		cc.assertCalls()
 
@@ -498,7 +541,7 @@ func TestStateMachine(t *testing.T) {
 	t.Logf("\n\nLogin2 (url response)")
 	notifies.expect(1)
 	url2 := "https://localhost:1/2"
-	cc.send(nil, url2, false, nil)
+	cc.send(sendOpt{url: url2})
 	{
 		cc.assertCalls()
 
@@ -518,7 +561,14 @@ func TestStateMachine(t *testing.T) {
 	notifies.expect(3)
 	cc.persist.UserProfile.LoginName = "user1"
 	cc.persist.NodeID = "node1"
-	cc.send(nil, "", true, &netmap.NetworkMap{})
+
+	// even if seamless is being enabled by default rather than by policy, this is
+	// the point where it will first get enabled.
+	if seamless {
+		sys.ControlKnobs().SeamlessKeyRenewal.Store(true)
+	}
+
+	cc.send(sendOpt{loginFinished: true, nm: &netmap.NetworkMap{}})
 	{
 		nn := notifies.drain(3)
 		// Arguably it makes sense to unpause now, since the machine
@@ -547,9 +597,9 @@ func TestStateMachine(t *testing.T) {
 	// but the current code is brittle.
 	// (ie. I suspect it would be better to change false->true in send()
 	// below, and do the same in the real controlclient.)
-	cc.send(nil, "", false, &netmap.NetworkMap{
+	cc.send(sendOpt{nm: &netmap.NetworkMap{
 		SelfNode: (&tailcfg.Node{MachineAuthorized: true}).View(),
-	})
+	}})
 	{
 		nn := notifies.drain(1)
 		cc.assertCalls()
@@ -710,7 +760,7 @@ func TestStateMachine(t *testing.T) {
 	// an interactive login URL to visit.
 	notifies.expect(2)
 	url3 := "https://localhost:1/3"
-	cc.send(nil, url3, false, nil)
+	cc.send(sendOpt{url: url3})
 	{
 		nn := notifies.drain(2)
 		cc.assertCalls("Login")
@@ -721,9 +771,9 @@ func TestStateMachine(t *testing.T) {
 	notifies.expect(3)
 	cc.persist.UserProfile.LoginName = "user2"
 	cc.persist.NodeID = "node2"
-	cc.send(nil, "", true, &netmap.NetworkMap{
+	cc.send(sendOpt{loginFinished: true, nm: &netmap.NetworkMap{
 		SelfNode: (&tailcfg.Node{MachineAuthorized: true}).View(),
-	})
+	}})
 	t.Logf("\n\nLoginFinished3")
 	{
 		nn := notifies.drain(3)
@@ -791,9 +841,9 @@ func TestStateMachine(t *testing.T) {
 	//  the control server at all when stopped).
 	t.Logf("\n\nStart4 -> netmap")
 	notifies.expect(0)
-	cc.send(nil, "", true, &netmap.NetworkMap{
+	cc.send(sendOpt{loginFinished: true, nm: &netmap.NetworkMap{
 		SelfNode: (&tailcfg.Node{MachineAuthorized: true}).View(),
-	})
+	}})
 	{
 		notifies.drain(0)
 		cc.assertCalls("pause")
@@ -838,7 +888,7 @@ func TestStateMachine(t *testing.T) {
 	notifies.expect(1)
 	b.StartLoginInteractive(context.Background())
 	url4 := "https://localhost:1/4"
-	cc.send(nil, url4, false, nil)
+	cc.send(sendOpt{url: url4})
 	{
 		nn := notifies.drain(1)
 		// It might seem like WantRunning should switch to true here,
@@ -860,9 +910,9 @@ func TestStateMachine(t *testing.T) {
 	notifies.expect(3)
 	cc.persist.UserProfile.LoginName = "user3"
 	cc.persist.NodeID = "node3"
-	cc.send(nil, "", true, &netmap.NetworkMap{
+	cc.send(sendOpt{loginFinished: true, nm: &netmap.NetworkMap{
 		SelfNode: (&tailcfg.Node{MachineAuthorized: true}).View(),
-	})
+	}})
 	{
 		nn := notifies.drain(3)
 		// BUG: pause() being called here is a bad sign.
@@ -908,9 +958,9 @@ func TestStateMachine(t *testing.T) {
 	// Control server accepts our valid key from before.
 	t.Logf("\n\nLoginFinished5")
 	notifies.expect(0)
-	cc.send(nil, "", true, &netmap.NetworkMap{
+	cc.send(sendOpt{loginFinished: true, nm: &netmap.NetworkMap{
 		SelfNode: (&tailcfg.Node{MachineAuthorized: true}).View(),
-	})
+	}})
 	{
 		notifies.drain(0)
 		cc.assertCalls()
@@ -923,10 +973,10 @@ func TestStateMachine(t *testing.T) {
 	}
 	t.Logf("\n\nExpireKey")
 	notifies.expect(1)
-	cc.send(nil, "", false, &netmap.NetworkMap{
+	cc.send(sendOpt{nm: &netmap.NetworkMap{
 		Expiry:   time.Now().Add(-time.Minute),
 		SelfNode: (&tailcfg.Node{MachineAuthorized: true}).View(),
-	})
+	}})
 	{
 		nn := notifies.drain(1)
 		cc.assertCalls()
@@ -938,10 +988,10 @@ func TestStateMachine(t *testing.T) {
 
 	t.Logf("\n\nExtendKey")
 	notifies.expect(1)
-	cc.send(nil, "", false, &netmap.NetworkMap{
+	cc.send(sendOpt{nm: &netmap.NetworkMap{
 		Expiry:   time.Now().Add(time.Minute),
 		SelfNode: (&tailcfg.Node{MachineAuthorized: true}).View(),
-	})
+	}})
 	{
 		nn := notifies.drain(1)
 		cc.assertCalls()
@@ -966,7 +1016,7 @@ func TestEditPrefsHasNoKeys(t *testing.T) {
 	logf := tstest.WhileTestRunningLogger(t)
 	sys := tsd.NewSystem()
 	sys.Set(new(mem.Store))
-	e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry(), sys.Bus.Get())
+	e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker.Get(), sys.UserMetricsRegistry(), sys.Bus.Get())
 	if err != nil {
 		t.Fatalf("NewFakeUserspaceEngine: %v", err)
 	}
@@ -1076,9 +1126,9 @@ func TestWGEngineStatusRace(t *testing.T) {
 	wantState(ipn.NeedsLogin)
 
 	// Assert that we are logged in and authorized.
-	cc.send(nil, "", true, &netmap.NetworkMap{
+	cc.send(sendOpt{loginFinished: true, nm: &netmap.NetworkMap{
 		SelfNode: (&tailcfg.Node{MachineAuthorized: true}).View(),
-	})
+	}})
 	wantState(ipn.Starting)
 
 	// Simulate multiple concurrent callbacks from wgengine.
@@ -1354,11 +1404,141 @@ func TestEngineReconfigOnStateChange(t *testing.T) {
 			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
 				mustDo(t)(lb.Start(ipn.Options{}))
 				mustDo2(t)(lb.EditPrefs(connect))
-				cc().authenticated(node3)
-				cc().send(nil, "", false, &netmap.NetworkMap{
+				cc().authenticated(node1)
+				cc().send(sendOpt{nm: &netmap.NetworkMap{
 					Expiry: time.Now().Add(-time.Minute),
-				})
+				}})
 			},
+			wantState:     ipn.NeedsLogin,
+			wantCfg:       &wgcfg.Config{},
+			wantRouterCfg: &router.Config{},
+			wantDNSCfg:    &dns.Config{},
+		},
+		{
+			name: "Start/Connect/Login/InitReauth",
+			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
+				mustDo(t)(lb.Start(ipn.Options{}))
+				mustDo2(t)(lb.EditPrefs(connect))
+				cc().authenticated(node1)
+
+				// Start the re-auth process:
+				lb.StartLoginInteractive(context.Background())
+				cc().sendAuthURL(node1)
+			},
+			// Without seamless renewal, even starting a reauth tears down everything:
+			wantState:     ipn.Starting,
+			wantCfg:       &wgcfg.Config{},
+			wantRouterCfg: &router.Config{},
+			wantDNSCfg:    &dns.Config{},
+		},
+		{
+			name: "Start/Connect/Login/InitReauth/Login",
+			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
+				mustDo(t)(lb.Start(ipn.Options{}))
+				mustDo2(t)(lb.EditPrefs(connect))
+				cc().authenticated(node1)
+
+				// Start the re-auth process:
+				lb.StartLoginInteractive(context.Background())
+				cc().sendAuthURL(node1)
+
+				// Complete the re-auth process:
+				cc().authenticated(node1)
+			},
+			wantState: ipn.Starting,
+			wantCfg: &wgcfg.Config{
+				Name:      "tailscale",
+				NodeID:    node1.SelfNode.StableID(),
+				Peers:     []wgcfg.Peer{},
+				Addresses: node1.SelfNode.Addresses().AsSlice(),
+			},
+			wantRouterCfg: &router.Config{
+				SNATSubnetRoutes: true,
+				NetfilterMode:    preftype.NetfilterOn,
+				LocalAddrs:       node1.SelfNode.Addresses().AsSlice(),
+				Routes:           routesWithQuad100(),
+			},
+			wantDNSCfg: &dns.Config{
+				Routes: map[dnsname.FQDN][]*dnstype.Resolver{},
+				Hosts:  hostsFor(node1),
+			},
+		},
+		{
+			name: "Seamless/Start/Connect/Login/InitReauth",
+			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
+				lb.ControlKnobs().SeamlessKeyRenewal.Store(true)
+				mustDo(t)(lb.Start(ipn.Options{}))
+				mustDo2(t)(lb.EditPrefs(connect))
+				cc().authenticated(node1)
+
+				// Start the re-auth process:
+				lb.StartLoginInteractive(context.Background())
+				cc().sendAuthURL(node1)
+			},
+			// With seamless renewal, starting a reauth should leave everything up:
+			wantState: ipn.Starting,
+			wantCfg: &wgcfg.Config{
+				Name:      "tailscale",
+				NodeID:    node1.SelfNode.StableID(),
+				Peers:     []wgcfg.Peer{},
+				Addresses: node1.SelfNode.Addresses().AsSlice(),
+			},
+			wantRouterCfg: &router.Config{
+				SNATSubnetRoutes: true,
+				NetfilterMode:    preftype.NetfilterOn,
+				LocalAddrs:       node1.SelfNode.Addresses().AsSlice(),
+				Routes:           routesWithQuad100(),
+			},
+			wantDNSCfg: &dns.Config{
+				Routes: map[dnsname.FQDN][]*dnstype.Resolver{},
+				Hosts:  hostsFor(node1),
+			},
+		},
+		{
+			name: "Seamless/Start/Connect/Login/InitReauth/Login",
+			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
+				lb.ControlKnobs().SeamlessKeyRenewal.Store(true)
+				mustDo(t)(lb.Start(ipn.Options{}))
+				mustDo2(t)(lb.EditPrefs(connect))
+				cc().authenticated(node1)
+
+				// Start the re-auth process:
+				lb.StartLoginInteractive(context.Background())
+				cc().sendAuthURL(node1)
+
+				// Complete the re-auth process:
+				cc().authenticated(node1)
+			},
+			wantState: ipn.Starting,
+			wantCfg: &wgcfg.Config{
+				Name:      "tailscale",
+				NodeID:    node1.SelfNode.StableID(),
+				Peers:     []wgcfg.Peer{},
+				Addresses: node1.SelfNode.Addresses().AsSlice(),
+			},
+			wantRouterCfg: &router.Config{
+				SNATSubnetRoutes: true,
+				NetfilterMode:    preftype.NetfilterOn,
+				LocalAddrs:       node1.SelfNode.Addresses().AsSlice(),
+				Routes:           routesWithQuad100(),
+			},
+			wantDNSCfg: &dns.Config{
+				Routes: map[dnsname.FQDN][]*dnstype.Resolver{},
+				Hosts:  hostsFor(node1),
+			},
+		},
+		{
+			name: "Seamless/Start/Connect/Login/Expire",
+			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
+				lb.ControlKnobs().SeamlessKeyRenewal.Store(true)
+				mustDo(t)(lb.Start(ipn.Options{}))
+				mustDo2(t)(lb.EditPrefs(connect))
+				cc().authenticated(node1)
+				cc().send(sendOpt{nm: &netmap.NetworkMap{
+					Expiry: time.Now().Add(-time.Minute),
+				}})
+			},
+			// Even with seamless, if the key we are using expires, we want to disconnect:
 			wantState:     ipn.NeedsLogin,
 			wantCfg:       &wgcfg.Config{},
 			wantRouterCfg: &router.Config{},
@@ -1402,6 +1582,235 @@ func TestEngineReconfigOnStateChange(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestStateMachineURLRace tests that wgengine updates arriving in the middle of
+// processing an auth URL doesn't result in the auth URL being cleared.
+func TestStateMachineURLRace(t *testing.T) {
+	runTestStateMachineURLRace(t, false)
+}
+
+func TestStateMachineURLRaceSeamless(t *testing.T) {
+	runTestStateMachineURLRace(t, true)
+}
+
+func runTestStateMachineURLRace(t *testing.T, seamless bool) {
+	var cc *mockControl
+	b := newLocalBackendWithTestControl(t, true, func(tb testing.TB, opts controlclient.Options) controlclient.Client {
+		cc = newClient(t, opts)
+		return cc
+	})
+
+	nw := newNotificationWatcher(t, b, &ipnauth.TestActor{})
+
+	t.Logf("Start")
+	nw.watch(0, []wantedNotification{
+		wantStateNotify(ipn.NeedsLogin)})
+	b.Start(ipn.Options{
+		UpdatePrefs: &ipn.Prefs{
+			WantRunning: true,
+			ControlURL:  "https://localhost:1/",
+		},
+	})
+	nw.check()
+
+	t.Logf("LoginFinished")
+	cc.persist.UserProfile.LoginName = "user1"
+	cc.persist.NodeID = "node1"
+
+	if seamless {
+		b.sys.ControlKnobs().SeamlessKeyRenewal.Store(true)
+	}
+
+	nw.watch(0, []wantedNotification{
+		wantStateNotify(ipn.Starting)})
+	cc.send(sendOpt{loginFinished: true, nm: &netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{MachineAuthorized: true}).View(),
+	}})
+	nw.check()
+
+	t.Logf("Running")
+	nw.watch(0, []wantedNotification{
+		wantStateNotify(ipn.Running)})
+	b.setWgengineStatus(&wgengine.Status{AsOf: time.Now(), DERPs: 1}, nil)
+	nw.check()
+
+	t.Logf("Re-auth (StartLoginInteractive)")
+	b.StartLoginInteractive(t.Context())
+
+	stop := make(chan struct{})
+	stopSpamming := sync.OnceFunc(func() {
+		stop <- struct{}{}
+	})
+	// if seamless renewal is enabled, the engine won't be disabled, and we won't
+	// ever call stopSpamming, so make sure it does get called
+	defer stopSpamming()
+
+	// Intercept updates between the engine and localBackend, so that we can see
+	// when the "stopped" update comes in and ensure we stop sending our "we're
+	// up" updates after that point.
+	b.e.SetStatusCallback(func(s *wgengine.Status, err error) {
+		// This is not one of our fake status updates, this is generated from the
+		// engine in response to LocalBackend calling RequestStatus. Stop spamming
+		// our fake statuses.
+		//
+		// TODO(zofrex): This is fragile, it works right now but would break if the
+		// calling pattern of RequestStatus changes. We should ensure that we keep
+		// sending "we're up" statuses right until Reconfig is called with
+		// zero-valued configs, and after that point only send "stopped" statuses.
+		stopSpamming()
+
+		// Once stopSpamming returns we are guaranteed to not send any more updates,
+		// so we can now send the real update (indicating shutdown) and be certain
+		// it will be received after any fake updates we sent. This is possibly a
+		// stronger guarantee than we get from the real engine?
+		b.setWgengineStatus(s, err)
+	})
+
+	// time needs to be >= last time for the status to be accepted, send all our
+	// spam with the same stale time so that when a real update comes in it will
+	// definitely be accepted.
+	time := b.lastStatusTime
+
+	// Flood localBackend with a lot of wgengine status updates, so if there are
+	// any race conditions in the multiple locks/unlocks that happen as we process
+	// the received auth URL, we will hit them.
+	go func() {
+		t.Logf("sending lots of fake wgengine status updates")
+		for {
+			select {
+			case <-stop:
+				t.Logf("stopping fake wgengine status updates")
+				return
+			default:
+				b.setWgengineStatus(&wgengine.Status{AsOf: time, DERPs: 1}, nil)
+			}
+		}
+	}()
+
+	t.Logf("Re-auth (receive URL)")
+	url1 := "https://localhost:1/1"
+	cc.send(sendOpt{url: url1})
+
+	// Don't need to wait on anything else - once .send completes, authURL should
+	// be set, and once .send has completed, any opportunities for a WG engine
+	// status update to trample it have ended as well.
+	if b.authURL == "" {
+		t.Fatalf("expected authURL to be set")
+	}
+}
+
+func TestWGEngineDownThenUpRace(t *testing.T) {
+	var cc *mockControl
+	b := newLocalBackendWithTestControl(t, true, func(tb testing.TB, opts controlclient.Options) controlclient.Client {
+		cc = newClient(t, opts)
+		return cc
+	})
+
+	nw := newNotificationWatcher(t, b, &ipnauth.TestActor{})
+
+	t.Logf("Start")
+	nw.watch(0, []wantedNotification{
+		wantStateNotify(ipn.NeedsLogin)})
+	b.Start(ipn.Options{
+		UpdatePrefs: &ipn.Prefs{
+			WantRunning: true,
+			ControlURL:  "https://localhost:1/",
+		},
+	})
+	nw.check()
+
+	t.Logf("LoginFinished")
+	cc.persist.UserProfile.LoginName = "user1"
+	cc.persist.NodeID = "node1"
+
+	nw.watch(0, []wantedNotification{
+		wantStateNotify(ipn.Starting)})
+	cc.send(sendOpt{loginFinished: true, nm: &netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{MachineAuthorized: true}).View(),
+	}})
+	nw.check()
+
+	nw.watch(0, []wantedNotification{
+		wantStateNotify(ipn.Running)})
+	b.setWgengineStatus(&wgengine.Status{AsOf: time.Now(), DERPs: 1}, nil)
+	nw.check()
+
+	t.Logf("Re-auth (StartLoginInteractive)")
+	b.StartLoginInteractive(t.Context())
+
+	var timeLock sync.RWMutex
+	timestamp := b.lastStatusTime
+
+	engineShutdown := make(chan struct{})
+	gotShutdown := sync.OnceFunc(func() {
+		t.Logf("engineShutdown")
+		engineShutdown <- struct{}{}
+	})
+
+	b.e.SetStatusCallback(func(s *wgengine.Status, err error) {
+		timeLock.Lock()
+		if s.AsOf.After(timestamp) {
+			timestamp = s.AsOf
+		}
+		timeLock.Unlock()
+
+		if err != nil || (s.DERPs == 0 && len(s.Peers) == 0) {
+			gotShutdown()
+		} else {
+			b.setWgengineStatus(s, err)
+		}
+	})
+
+	t.Logf("Re-auth (receive URL)")
+	url1 := "https://localhost:1/1"
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+
+	wg.Go(func() {
+		t.Log("cc.send starting")
+		cc.send(sendOpt{url: url1}) // will block until engine stops
+		t.Log("cc.send returned")
+	})
+
+	<-engineShutdown // will get called once cc.send is blocked
+	gotShutdown = sync.OnceFunc(func() {
+		t.Logf("engineShutdown")
+		engineShutdown <- struct{}{}
+	})
+
+	wg.Go(func() {
+		t.Log("StartLoginInteractive starting")
+		b.StartLoginInteractive(t.Context()) // will also block until engine stops
+		t.Log("StartLoginInteractive returned")
+	})
+
+	<-engineShutdown // will get called once StartLoginInteractive is blocked
+
+	st := controlclient.Status{}
+	st.SetStateForTest(controlclient.StateAuthenticated)
+	b.SetControlClientStatus(cc, st)
+
+	timeLock.RLock()
+	b.setWgengineStatus(&wgengine.Status{AsOf: timestamp}, nil)           // engine is down event finally arrives
+	b.setWgengineStatus(&wgengine.Status{AsOf: timestamp, DERPs: 1}, nil) // engine is back up
+	timeLock.RUnlock()
+
+	go func() {
+		wg.Wait()
+		done <- struct{}{}
+	}()
+
+	t.Log("waiting for .send and .StartLoginInteractive to return")
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting")
+	}
+
+	t.Log("both returned")
 }
 
 func buildNetmapWithPeers(self tailcfg.NodeView, peers ...tailcfg.NodeView) *netmap.NetworkMap {
@@ -1507,16 +1916,18 @@ func newLocalBackendWithMockEngineAndControl(t *testing.T, enableLogging bool) (
 	dialer := &tsdial.Dialer{Logf: logf}
 	dialer.SetNetMon(netmon.NewStatic())
 
-	sys := tsd.NewSystem()
+	bus := eventbustest.NewBus(t)
+	sys := tsd.NewSystemWithBus(bus)
 	sys.Set(dialer)
 	sys.Set(dialer.NetMon())
+	dialer.SetBus(bus)
 
 	magicConn, err := magicsock.NewConn(magicsock.Options{
 		Logf:              logf,
 		EventBus:          sys.Bus.Get(),
 		NetMon:            dialer.NetMon(),
 		Metrics:           sys.UserMetricsRegistry(),
-		HealthTracker:     sys.HealthTracker(),
+		HealthTracker:     sys.HealthTracker.Get(),
 		DisablePortMapper: true,
 	})
 	if err != nil {

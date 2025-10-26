@@ -36,6 +36,7 @@ import (
 	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/util/must"
 )
 
@@ -148,6 +149,8 @@ func testControlHTTP(t *testing.T, param httpTestParam) {
 	proxy := param.proxy
 	client, server := key.NewMachine(), key.NewMachine()
 
+	bus := eventbustest.NewBus(t)
+
 	const testProtocolVersion = 1
 	const earlyWriteMsg = "Hello, world!"
 	sch := make(chan serverResult, 1)
@@ -217,6 +220,7 @@ func testControlHTTP(t *testing.T, param httpTestParam) {
 
 	netMon := netmon.NewStatic()
 	dialer := tsdial.NewDialer(netMon)
+	dialer.SetBus(bus)
 	a := &Dialer{
 		Hostname:             "localhost",
 		HTTPPort:             strconv.Itoa(httpLn.Addr().(*net.TCPAddr).Port),
@@ -230,7 +234,7 @@ func testControlHTTP(t *testing.T, param httpTestParam) {
 		omitCertErrorLogging: true,
 		testFallbackDelay:    fallbackDelay,
 		Clock:                clock,
-		HealthTracker:        new(health.Tracker),
+		HealthTracker:        health.NewTracker(eventbustest.NewBus(t)),
 	}
 
 	if param.httpInDial {
@@ -774,7 +778,7 @@ func runDialPlanTest(t *testing.T, plan *tailcfg.ControlDialPlan, want []netip.A
 	if allowFallback {
 		host = fallbackAddr.String()
 	}
-
+	bus := eventbustest.NewBus(t)
 	a := &Dialer{
 		Hostname:             host,
 		HTTPPort:             httpPort,
@@ -789,7 +793,7 @@ func runDialPlanTest(t *testing.T, plan *tailcfg.ControlDialPlan, want []netip.A
 		omitCertErrorLogging: true,
 		testFallbackDelay:    50 * time.Millisecond,
 		Clock:                clock,
-		HealthTracker:        new(health.Tracker),
+		HealthTracker:        health.NewTracker(bus),
 	}
 
 	start := time.Now()

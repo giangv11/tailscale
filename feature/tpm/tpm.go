@@ -14,6 +14,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -22,32 +23,66 @@ import (
 	"github.com/google/go-tpm/tpm2/transport"
 	"golang.org/x/crypto/nacl/secretbox"
 	"tailscale.com/atomicfile"
+	"tailscale.com/envknob"
 	"tailscale.com/feature"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store"
 	"tailscale.com/paths"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/testenv"
 )
 
 var infoOnce = sync.OnceValue(info)
 
 func init() {
 	feature.Register("tpm")
+	feature.HookTPMAvailable.Set(tpmSupported)
+	feature.HookHardwareAttestationAvailable.Set(tpmSupported)
+
 	hostinfo.RegisterHostinfoNewHook(func(hi *tailcfg.Hostinfo) {
 		hi.TPM = infoOnce()
 	})
 	store.Register(store.TPMPrefix, newStore)
+	if runtime.GOOS == "linux" || runtime.GOOS == "windows" {
+		key.RegisterHardwareAttestationKeyFns(
+			func() key.HardwareAttestationKey { return &attestationKey{} },
+			func() (key.HardwareAttestationKey, error) { return newAttestationKey() },
+		)
+	}
 }
 
-func info() *tailcfg.TPMInfo {
+func tpmSupported() bool {
 	tpm, err := open()
 	if err != nil {
-		log.Printf("TPM: error opening: %v", err)
+		return false
+	}
+	tpm.Close()
+	return true
+}
+
+var verboseTPM = envknob.RegisterBool("TS_DEBUG_TPM")
+
+func info() *tailcfg.TPMInfo {
+	logf := logger.Discard
+	if !testenv.InTest() || verboseTPM() {
+		logf = log.New(log.Default().Writer(), "TPM: ", 0).Printf
+	}
+
+	tpm, err := open()
+	if err != nil {
+		if !os.IsNotExist(err) || verboseTPM() {
+			// Only log if it's an interesting error, not just "no TPM",
+			// as is very common, especially in VMs.
+			logf("error opening: %v", err)
+		}
 		return nil
 	}
-	log.Printf("TPM: successfully opened")
+	if verboseTPM() {
+		logf("successfully opened")
+	}
 	defer tpm.Close()
 
 	info := new(tailcfg.TPMInfo)
@@ -76,12 +111,12 @@ func info() *tailcfg.TPMInfo {
 			PropertyCount: 1,
 		}.Execute(tpm)
 		if err != nil {
-			log.Printf("TPM: GetCapability %v: %v", cap.prop, err)
+			logf("GetCapability %v: %v", cap.prop, err)
 			continue
 		}
 		props, err := resp.CapabilityData.Data.TPMProperties()
 		if err != nil {
-			log.Printf("TPM: GetCapability %v: %v", cap.prop, err)
+			logf("GetCapability %v: %v", cap.prop, err)
 			continue
 		}
 		if len(props.TPMProperty) == 0 {
@@ -89,6 +124,7 @@ func info() *tailcfg.TPMInfo {
 		}
 		cap.apply(info, props.TPMProperty[0].Value)
 	}
+	logf("successfully read all properties")
 	return info
 }
 

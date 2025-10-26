@@ -34,8 +34,7 @@ import (
 
 	"go4.org/mem"
 	"tailscale.com/client/local"
-	"tailscale.com/derp"
-	"tailscale.com/derp/derphttp"
+	"tailscale.com/derp/derpserver"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/ipnstate"
@@ -297,14 +296,14 @@ func exe() string {
 func RunDERPAndSTUN(t testing.TB, logf logger.Logf, ipAddress string) (derpMap *tailcfg.DERPMap) {
 	t.Helper()
 
-	d := derp.NewServer(key.NewNode(), logf)
+	d := derpserver.New(key.NewNode(), logf)
 
 	ln, err := net.Listen("tcp", net.JoinHostPort(ipAddress, "0"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	httpsrv := httptest.NewUnstartedServer(derphttp.Handler(d))
+	httpsrv := httptest.NewUnstartedServer(derpserver.Handler(d))
 	httpsrv.Listener.Close()
 	httpsrv.Listener = ln
 	httpsrv.Config.ErrorLog = logger.StdLogger(logf)
@@ -480,11 +479,13 @@ func (lc *LogCatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // TestEnv contains the test environment (set of servers) used by one
 // or more nodes.
 type TestEnv struct {
-	t            testing.TB
-	tunMode      bool
-	cli          string
-	daemon       string
-	loopbackPort *int
+	t                      testing.TB
+	tunMode                bool
+	cli                    string
+	daemon                 string
+	loopbackPort           *int
+	neverDirectUDP         bool
+	relayServerUseLoopback bool
 
 	LogCatcher       *LogCatcher
 	LogCatcherServer *httptest.Server
@@ -842,6 +843,12 @@ func (n *TestNode) StartDaemonAsIPNGOOS(ipnGOOS string) *Daemon {
 	if n.env.loopbackPort != nil {
 		cmd.Env = append(cmd.Env, "TS_DEBUG_NETSTACK_LOOPBACK_PORT="+strconv.Itoa(*n.env.loopbackPort))
 	}
+	if n.env.neverDirectUDP {
+		cmd.Env = append(cmd.Env, "TS_DEBUG_NEVER_DIRECT_UDP=1")
+	}
+	if n.env.relayServerUseLoopback {
+		cmd.Env = append(cmd.Env, "TS_DEBUG_RELAY_SERVER_ADDRS=::1,127.0.0.1")
+	}
 	if version.IsRace() {
 		cmd.Env = append(cmd.Env, "GORACE=halt_on_error=1")
 	}
@@ -1091,21 +1098,44 @@ func (tt *trafficTrap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 type authURLParserWriter struct {
+	t   *testing.T
 	buf bytes.Buffer
-	fn  func(urlStr string) error
+	// Handle login URLs, and count how many times they were seen
+	authURLFn func(urlStr string) error
+	// Handle machine approval URLs, and count how many times they were seen.
+	deviceApprovalURLFn func(urlStr string) error
 }
 
+// Note: auth URLs from testcontrol look slightly different to real auth URLs,
+// e.g. http://127.0.0.1:60456/auth/96af2ff7e04ae1499a9a
 var authURLRx = regexp.MustCompile(`(https?://\S+/auth/\S+)`)
 
+// Looks for any device approval URL, which is any URL ending with `/admin`
+// e.g. http://127.0.0.1:60456/admin
+var deviceApprovalURLRx = regexp.MustCompile(`(https?://\S+/admin)[^\S]`)
+
 func (w *authURLParserWriter) Write(p []byte) (n int, err error) {
+	w.t.Helper()
+	w.t.Logf("received bytes: %s", string(p))
 	n, err = w.buf.Write(p)
+
+	defer w.buf.Reset() // so it's not matched again
+
 	m := authURLRx.FindSubmatch(w.buf.Bytes())
 	if m != nil {
 		urlStr := string(m[1])
-		w.buf.Reset() // so it's not matched again
-		if err := w.fn(urlStr); err != nil {
+		if err := w.authURLFn(urlStr); err != nil {
 			return 0, err
 		}
 	}
+
+	m = deviceApprovalURLRx.FindSubmatch(w.buf.Bytes())
+	if m != nil && w.deviceApprovalURLFn != nil {
+		urlStr := string(m[1])
+		if err := w.deviceApprovalURLFn(urlStr); err != nil {
+			return 0, err
+		}
+	}
+
 	return n, err
 }

@@ -30,10 +30,11 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/appc"
 	"tailscale.com/appc/appctest"
-	"tailscale.com/clientupdate"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/drive"
 	"tailscale.com/drive/driveimpl"
+	"tailscale.com/feature"
+	_ "tailscale.com/feature/condregister/portmapper"
 	"tailscale.com/health"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
@@ -48,6 +49,7 @@ import (
 	"tailscale.com/tsd"
 	"tailscale.com/tstest"
 	"tailscale.com/tstest/deptest"
+	"tailscale.com/types/appctype"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
@@ -59,6 +61,7 @@ import (
 	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/eventbus"
+	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/must"
 	"tailscale.com/util/set"
@@ -71,8 +74,6 @@ import (
 	"tailscale.com/wgengine/filter/filtertype"
 	"tailscale.com/wgengine/wgcfg"
 )
-
-func fakeStoreRoutes(*appc.RouteInfo) error { return nil }
 
 func inRemove(ip netip.Addr) bool {
 	for _, pfx := range removeFromDefaultRoute {
@@ -455,7 +456,8 @@ func (panicOnUseTransport) RoundTrip(*http.Request) (*http.Response, error) {
 }
 
 func newTestLocalBackend(t testing.TB) *LocalBackend {
-	return newTestLocalBackendWithSys(t, tsd.NewSystem())
+	bus := eventbustest.NewBus(t)
+	return newTestLocalBackendWithSys(t, tsd.NewSystemWithBus(bus))
 }
 
 // newTestLocalBackendWithSys creates a new LocalBackend with the given tsd.System.
@@ -468,7 +470,7 @@ func newTestLocalBackendWithSys(t testing.TB, sys *tsd.System) *LocalBackend {
 		t.Log("Added memory store for testing")
 	}
 	if _, ok := sys.Engine.GetOK(); !ok {
-		eng, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry(), sys.Bus.Get())
+		eng, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker.Get(), sys.UserMetricsRegistry(), sys.Bus.Get())
 		if err != nil {
 			t.Fatalf("NewFakeUserspaceEngine: %v", err)
 		}
@@ -477,7 +479,9 @@ func newTestLocalBackendWithSys(t testing.TB, sys *tsd.System) *LocalBackend {
 		t.Log("Added fake userspace engine for testing")
 	}
 	if _, ok := sys.Dialer.GetOK(); !ok {
-		sys.Set(tsdial.NewDialer(netmon.NewStatic()))
+		dialer := tsdial.NewDialer(netmon.NewStatic())
+		dialer.SetBus(sys.Bus.Get())
+		sys.Set(dialer)
 		t.Log("Added static dialer for testing")
 	}
 	lb, err := NewLocalBackend(logf, logid.PublicID{}, sys, 0)
@@ -533,7 +537,6 @@ func TestZeroExitNodeViaLocalAPI(t *testing.T) {
 			ExitNodeID: "",
 		},
 	}, user)
-
 	if err != nil {
 		t.Fatalf("enabling first exit node: %v", err)
 	}
@@ -543,7 +546,6 @@ func TestZeroExitNodeViaLocalAPI(t *testing.T) {
 	if got, want := pv.InternalExitNodePrior(), tailcfg.StableNodeID(""); got != want {
 		t.Fatalf("unexpected InternalExitNodePrior %q, want: %q", got, want)
 	}
-
 }
 
 func TestSetUseExitNodeEnabled(t *testing.T) {
@@ -1501,6 +1503,15 @@ func wantExitNodeIDNotify(want tailcfg.StableNodeID) wantedNotification {
 	}
 }
 
+func wantStateNotify(want ipn.State) wantedNotification {
+	return wantedNotification{
+		name: "State=" + want.String(),
+		cond: func(_ testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+			return n.State != nil && *n.State == want
+		},
+	}
+}
+
 func TestInternalAndExternalInterfaces(t *testing.T) {
 	type interfacePrefix struct {
 		i   netmon.Interface
@@ -2304,14 +2315,13 @@ func TestDNSConfigForNetmapForExitNodeConfigs(t *testing.T) {
 func TestOfferingAppConnector(t *testing.T) {
 	for _, shouldStore := range []bool{false, true} {
 		b := newTestBackend(t)
+		bus := b.sys.Bus.Get()
 		if b.OfferingAppConnector() {
 			t.Fatal("unexpected offering app connector")
 		}
-		if shouldStore {
-			b.appConnector = appc.NewAppConnector(t.Logf, nil, &appc.RouteInfo{}, fakeStoreRoutes)
-		} else {
-			b.appConnector = appc.NewAppConnector(t.Logf, nil, nil, nil)
-		}
+		b.appConnector = appc.NewAppConnector(appc.Config{
+			Logf: t.Logf, EventBus: bus, HasStoredRoutes: shouldStore,
+		})
 		if !b.OfferingAppConnector() {
 			t.Fatal("unexpected not offering app connector")
 		}
@@ -2361,6 +2371,8 @@ func TestRouterAdvertiserIgnoresContainedRoutes(t *testing.T) {
 func TestObserveDNSResponse(t *testing.T) {
 	for _, shouldStore := range []bool{false, true} {
 		b := newTestBackend(t)
+		bus := b.sys.Bus.Get()
+		w := eventbustest.NewWatcher(t, bus)
 
 		// ensure no error when no app connector is configured
 		if err := b.ObserveDNSResponse(dnsResponse("example.com.", "192.0.0.8")); err != nil {
@@ -2368,21 +2380,29 @@ func TestObserveDNSResponse(t *testing.T) {
 		}
 
 		rc := &appctest.RouteCollector{}
-		if shouldStore {
-			b.appConnector = appc.NewAppConnector(t.Logf, rc, &appc.RouteInfo{}, fakeStoreRoutes)
-		} else {
-			b.appConnector = appc.NewAppConnector(t.Logf, rc, nil, nil)
-		}
-		b.appConnector.UpdateDomains([]string{"example.com"})
-		b.appConnector.Wait(context.Background())
+		a := appc.NewAppConnector(appc.Config{
+			Logf:            t.Logf,
+			EventBus:        bus,
+			RouteAdvertiser: rc,
+			HasStoredRoutes: shouldStore,
+		})
+		a.UpdateDomains([]string{"example.com"})
+		a.Wait(t.Context())
+		b.appConnector = a
 
 		if err := b.ObserveDNSResponse(dnsResponse("example.com.", "192.0.0.8")); err != nil {
 			t.Errorf("ObserveDNSResponse: %v", err)
 		}
-		b.appConnector.Wait(context.Background())
+		a.Wait(t.Context())
 		wantRoutes := []netip.Prefix{netip.MustParsePrefix("192.0.0.8/32")}
 		if !slices.Equal(rc.Routes(), wantRoutes) {
 			t.Fatalf("got routes %v, want %v", rc.Routes(), wantRoutes)
+		}
+
+		if err := eventbustest.Expect(w,
+			eqUpdate(appctype.RouteUpdate{Advertise: mustPrefix("192.0.0.8/32")}),
+		); err != nil {
+			t.Error(err)
 		}
 	}
 }
@@ -2534,7 +2554,7 @@ func TestBackfillAppConnectorRoutes(t *testing.T) {
 
 	// Store the test IP in profile data, but not in Prefs.AdvertiseRoutes.
 	b.ControlKnobs().AppCStoreRoutes.Store(true)
-	if err := b.storeRouteInfo(&appc.RouteInfo{
+	if err := b.storeRouteInfo(appctype.RouteInfo{
 		Domains: map[string][]netip.Addr{
 			"example.com": {ip},
 		},
@@ -2897,7 +2917,7 @@ func TestSetExitNodeIDPolicy(t *testing.T) {
 			if test.prefs == nil {
 				test.prefs = ipn.NewPrefs()
 			}
-			pm := must.Get(newProfileManager(new(mem.Store), t.Logf, new(health.Tracker)))
+			pm := must.Get(newProfileManager(new(mem.Store), t.Logf, health.NewTracker(eventbustest.NewBus(t))))
 			pm.prefs = test.prefs.View()
 			b.currentNode().SetNetMap(test.nm)
 			b.pm = pm
@@ -3100,12 +3120,14 @@ func TestAutoExitNodeSetNetInfoCallback(t *testing.T) {
 	b.hostinfo = hi
 	k := key.NewMachine()
 	var cc *mockControl
+	dialer := tsdial.NewDialer(netmon.NewStatic())
+	dialer.SetBus(sys.Bus.Get())
 	opts := controlclient.Options{
 		ServerURL: "https://example.com",
 		GetMachinePrivateKey: func() (key.MachinePrivate, error) {
 			return k, nil
 		},
-		Dialer:       tsdial.NewDialer(netmon.NewStatic()),
+		Dialer:       dialer,
 		Logf:         b.logf,
 		PolicyClient: polc,
 	}
@@ -3501,7 +3523,7 @@ func TestApplySysPolicy(t *testing.T) {
 					wantPrefs.ControlURL = ipn.DefaultControlURL
 				}
 
-				pm := must.Get(newProfileManager(new(mem.Store), t.Logf, new(health.Tracker)))
+				pm := must.Get(newProfileManager(new(mem.Store), t.Logf, health.NewTracker(eventbustest.NewBus(t))))
 				pm.prefs = usePrefs.View()
 
 				b := newTestBackend(t, polc)
@@ -3619,7 +3641,8 @@ func TestPreferencePolicyInfo(t *testing.T) {
 					prefs := defaultPrefs.AsStruct()
 					pp.set(prefs, tt.initialValue)
 
-					sys := tsd.NewSystem()
+					bus := eventbustest.NewBus(t)
+					sys := tsd.NewSystemWithBus(bus)
 					sys.PolicyClient.Set(polc)
 
 					lb := newTestLocalBackendWithSys(t, sys)
@@ -3708,7 +3731,7 @@ func TestOnTailnetDefaultAutoUpdate(t *testing.T) {
 			// On platforms that don't support auto-update we can never
 			// transition to auto-updates being enabled. The value should
 			// remain unchanged after onTailnetDefaultAutoUpdate.
-			if !clientupdate.CanAutoUpdate() {
+			if !feature.CanAutoUpdate() {
 				want = tt.before
 			}
 			if got := b.pm.CurrentPrefs().AutoUpdate().Apply; got != want {
@@ -4902,7 +4925,7 @@ func TestSuggestExitNode(t *testing.T) {
 				allowList = set.SetOf(tt.allowPolicy)
 			}
 
-			nb := newNodeBackend(t.Context(), eventbus.New())
+			nb := newNodeBackend(t.Context(), tstest.WhileTestRunningLogger(t), eventbus.New())
 			defer nb.shutdown(errShutdown)
 			nb.SetNetMap(tt.netMap)
 
@@ -5355,7 +5378,7 @@ func TestSuggestExitNodeTrafficSteering(t *testing.T) {
 				tt.netMap.AllCaps = set.SetOf(slices.Collect(caps))
 			}
 
-			nb := newNodeBackend(t.Context(), eventbus.New())
+			nb := newNodeBackend(t.Context(), tstest.WhileTestRunningLogger(t), eventbus.New())
 			defer nb.shutdown(errShutdown)
 			nb.SetNetMap(tt.netMap)
 
@@ -5453,7 +5476,7 @@ func TestEnableAutoUpdates(t *testing.T) {
 	})
 	// Enabling may fail, depending on which environment we are running this
 	// test in.
-	wantErr := !clientupdate.CanAutoUpdate()
+	wantErr := !feature.CanAutoUpdate()
 	gotErr := err != nil
 	if gotErr != wantErr {
 		t.Fatalf("enabling auto-updates: got error: %v (%v); want error: %v", gotErr, err, wantErr)
@@ -5484,10 +5507,10 @@ func TestReadWriteRouteInfo(t *testing.T) {
 	b.pm.currentProfile = prof1.View()
 
 	// set up routeInfo
-	ri1 := &appc.RouteInfo{}
+	ri1 := appctype.RouteInfo{}
 	ri1.Wildcards = []string{"1"}
 
-	ri2 := &appc.RouteInfo{}
+	ri2 := appctype.RouteInfo{}
 	ri2.Wildcards = []string{"2"}
 
 	// read before write
@@ -5786,7 +5809,8 @@ func TestNotificationTargetMatch(t *testing.T) {
 type newTestControlFn func(tb testing.TB, opts controlclient.Options) controlclient.Client
 
 func newLocalBackendWithTestControl(t *testing.T, enableLogging bool, newControl newTestControlFn) *LocalBackend {
-	return newLocalBackendWithSysAndTestControl(t, enableLogging, tsd.NewSystem(), newControl)
+	bus := eventbustest.NewBus(t)
+	return newLocalBackendWithSysAndTestControl(t, enableLogging, tsd.NewSystemWithBus(bus), newControl)
 }
 
 func newLocalBackendWithSysAndTestControl(t *testing.T, enableLogging bool, sys *tsd.System, newControl newTestControlFn) *LocalBackend {
@@ -5800,7 +5824,7 @@ func newLocalBackendWithSysAndTestControl(t *testing.T, enableLogging bool, sys 
 		sys.Set(store)
 	}
 	if _, hasEngine := sys.Engine.GetOK(); !hasEngine {
-		e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry(), sys.Bus.Get())
+		e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker.Get(), sys.UserMetricsRegistry(), sys.Bus.Get())
 		if err != nil {
 			t.Fatalf("NewFakeUserspaceEngine: %v", err)
 		}
@@ -5813,7 +5837,6 @@ func newLocalBackendWithSysAndTestControl(t *testing.T, enableLogging bool, sys 
 		t.Fatalf("NewLocalBackend: %v", err)
 	}
 	t.Cleanup(b.Shutdown)
-	b.DisablePortMapperForTest()
 
 	b.SetControlClientGetterForTesting(func(opts controlclient.Options) (controlclient.Client, error) {
 		return newControl(t, opts), nil
@@ -5945,7 +5968,6 @@ func (w *notificationWatcher) watch(mask ipn.NotifyWatchOpt, wanted []wantedNoti
 
 			return true
 		})
-
 	}()
 	<-watchAddedCh
 }
@@ -6123,7 +6145,7 @@ func TestLoginNotifications(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			lb.cc.(*mockControl).send(nil, loginURL, false, nil)
+			lb.cc.(*mockControl).send(sendOpt{url: loginURL})
 
 			var wg sync.WaitGroup
 			wg.Add(len(sessions))
@@ -6788,7 +6810,7 @@ func TestSrcCapPacketFilter(t *testing.T) {
 	must.Do(k.UnmarshalText([]byte("nodekey:5c8f86d5fc70d924e55f02446165a5dae8f822994ad26bcf4b08fd841f9bf261")))
 
 	controlClient := lb.cc.(*mockControl)
-	controlClient.send(nil, "", false, &netmap.NetworkMap{
+	controlClient.send(sendOpt{nm: &netmap.NetworkMap{
 		SelfNode: (&tailcfg.Node{
 			Addresses: []netip.Prefix{netip.MustParsePrefix("1.1.1.1/32")},
 		}).View(),
@@ -6817,7 +6839,7 @@ func TestSrcCapPacketFilter(t *testing.T) {
 				},
 			}},
 		}},
-	})
+	}})
 
 	f := lb.GetFilterForTest()
 	res := f.Check(netip.MustParseAddr("2.2.2.2"), netip.MustParseAddr("1.1.1.1"), 22, ipproto.TCP)
@@ -6993,10 +7015,10 @@ func TestDisplayMessageIPNBus(t *testing.T) {
 			cc := lb.cc.(*mockControl)
 
 			// Assert that we are logged in and authorized, and also send our DisplayMessages
-			cc.send(nil, "", true, &netmap.NetworkMap{
+			cc.send(sendOpt{loginFinished: true, nm: &netmap.NetworkMap{
 				SelfNode:        (&tailcfg.Node{MachineAuthorized: true}).View(),
 				DisplayMessages: msgs,
-			})
+			}})
 
 			// Tell the health tracker that we are in a map poll because
 			// mockControl doesn't tell it
@@ -7005,6 +7027,27 @@ func TestDisplayMessageIPNBus(t *testing.T) {
 			// Assert that we got the expected notification
 			ipnWatcher.check()
 		})
+	}
+}
+
+func TestHardwareAttested(t *testing.T) {
+	b := new(LocalBackend)
+
+	// default false
+	if got := b.HardwareAttested(); got != false {
+		t.Errorf("HardwareAttested() = %v, want false", got)
+	}
+
+	// set true
+	b.SetHardwareAttested()
+	if got := b.HardwareAttested(); got != true {
+		t.Errorf("HardwareAttested() = %v, want true after SetHardwareAttested()", got)
+	}
+
+	// repeat calls are safe; still true
+	b.SetHardwareAttested()
+	if got := b.HardwareAttested(); got != true {
+		t.Errorf("HardwareAttested() = %v, want true after second SetHardwareAttested()", got)
 	}
 }
 
@@ -7039,4 +7082,42 @@ func toStrings[T ~string](in []T) []string {
 		out[i] = string(v)
 	}
 	return out
+}
+
+type textUpdate struct {
+	Advertise   []string
+	Unadvertise []string
+}
+
+func routeUpdateToText(u appctype.RouteUpdate) textUpdate {
+	var out textUpdate
+	for _, p := range u.Advertise {
+		out.Advertise = append(out.Advertise, p.String())
+	}
+	for _, p := range u.Unadvertise {
+		out.Unadvertise = append(out.Unadvertise, p.String())
+	}
+	return out
+}
+
+func mustPrefix(ss ...string) (out []netip.Prefix) {
+	for _, s := range ss {
+		out = append(out, netip.MustParsePrefix(s))
+	}
+	return
+}
+
+// eqUpdate generates an eventbus test filter that matches an appctype.RouteUpdate
+// message equal to want, or reports an error giving a human-readable diff.
+//
+// TODO(creachadair): This is copied from the appc test package, but we can't
+// put it into the appctest package because the appc tests depend on it and
+// that makes a cycle. Clean up those tests and put this somewhere common.
+func eqUpdate(want appctype.RouteUpdate) func(appctype.RouteUpdate) error {
+	return func(got appctype.RouteUpdate) error {
+		if diff := cmp.Diff(routeUpdateToText(got), routeUpdateToText(want)); diff != "" {
+			return fmt.Errorf("wrong update (-got, +want):\n%s", diff)
+		}
+		return nil
+	}
 }

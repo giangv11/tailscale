@@ -6,16 +6,23 @@
 package relayserver
 
 import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"net/netip"
+	"strings"
 	"sync"
 
 	"tailscale.com/disco"
+	"tailscale.com/envknob"
 	"tailscale.com/feature"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnext"
+	"tailscale.com/ipn/localapi"
 	"tailscale.com/net/udprelay"
-	"tailscale.com/net/udprelay/endpoint"
+	"tailscale.com/net/udprelay/status"
 	"tailscale.com/tailcfg"
-	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/eventbus"
@@ -29,6 +36,32 @@ const featureName = "relayserver"
 func init() {
 	feature.Register(featureName)
 	ipnext.RegisterExtension(featureName, newExtension)
+	localapi.Register("debug-peer-relay-sessions", servePeerRelayDebugSessions)
+}
+
+// servePeerRelayDebugSessions is an HTTP handler for the Local API that
+// returns debug/status information for peer relay sessions being relayed by
+// this Tailscale node. It writes a JSON-encoded [status.ServerStatus] into the
+// HTTP response, or returns an HTTP 405/500 with error text as the body.
+func servePeerRelayDebugSessions(h *localapi.Handler, w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "GET required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var e *extension
+	if ok := h.LocalBackend().FindMatchingExtension(&e); !ok {
+		http.Error(w, "peer relay server extension unavailable", http.StatusInternalServerError)
+		return
+	}
+
+	st := e.serverStatus()
+	j, err := json.Marshal(st)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to marshal json: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.Write(j)
 }
 
 // newExtension is an [ipnext.NewExtensionFn] that creates a new relay server
@@ -47,18 +80,13 @@ type extension struct {
 	logf logger.Logf
 	bus  *eventbus.Bus
 
-	mu                            sync.Mutex // guards the following fields
-	shutdown                      bool
-	port                          *int          // ipn.Prefs.RelayServerPort, nil if disabled
-	disconnectFromBusCh           chan struct{} // non-nil if consumeEventbusTopics is running, closed to signal it to return
-	busDoneCh                     chan struct{} // non-nil if consumeEventbusTopics is running, closed when it returns
-	hasNodeAttrDisableRelayServer bool          // tailcfg.NodeAttrDisableRelayServer
-}
+	mu       sync.Mutex // guards the following fields
+	shutdown bool
 
-// relayServer is the interface of [udprelay.Server].
-type relayServer interface {
-	AllocateEndpoint(discoA key.DiscoPublic, discoB key.DiscoPublic) (endpoint.ServerEndpoint, error)
-	Close() error
+	port                          *int                             // ipn.Prefs.RelayServerPort, nil if disabled
+	eventSubs                     *eventbus.Monitor                // nil if not connected to eventbus
+	debugSessionsCh               chan chan []status.ServerSession // non-nil if consumeEventbusTopics is running
+	hasNodeAttrDisableRelayServer bool                             // tailcfg.NodeAttrDisableRelayServer
 }
 
 // Name implements [ipnext.Extension].
@@ -82,14 +110,13 @@ func (e *extension) handleBusLifetimeLocked() {
 	if !busShouldBeRunning {
 		e.disconnectFromBusLocked()
 		return
-	}
-	if e.busDoneCh != nil {
+	} else if e.eventSubs != nil {
 		return // already running
 	}
-	port := *e.port
-	e.disconnectFromBusCh = make(chan struct{})
-	e.busDoneCh = make(chan struct{})
-	go e.consumeEventbusTopics(port)
+
+	ec := e.bus.Client("relayserver.extension")
+	e.debugSessionsCh = make(chan chan []status.ServerSession)
+	e.eventSubs = ptr.To(ec.Monitor(e.consumeEventbusTopics(ec, *e.port)))
 }
 
 func (e *extension) selfNodeViewChanged(nodeView tailcfg.NodeView) {
@@ -115,68 +142,99 @@ func (e *extension) profileStateChanged(_ ipn.LoginProfileView, prefs ipn.PrefsV
 	e.handleBusLifetimeLocked()
 }
 
-func (e *extension) consumeEventbusTopics(port int) {
-	defer close(e.busDoneCh)
-
-	eventClient := e.bus.Client("relayserver.extension")
-	reqSub := eventbus.Subscribe[magicsock.UDPRelayAllocReq](eventClient)
-	respPub := eventbus.Publish[magicsock.UDPRelayAllocResp](eventClient)
-	defer eventClient.Close()
-
-	var rs relayServer // lazily initialized
-	defer func() {
-		if rs != nil {
-			rs.Close()
+// overrideAddrs returns TS_DEBUG_RELAY_SERVER_ADDRS as []netip.Addr, if set. It
+// can be between 0 and 3 comma-separated Addrs. TS_DEBUG_RELAY_SERVER_ADDRS is
+// not a stable interface, and is subject to change.
+var overrideAddrs = sync.OnceValue(func() (ret []netip.Addr) {
+	all := envknob.String("TS_DEBUG_RELAY_SERVER_ADDRS")
+	const max = 3
+	remain := all
+	for remain != "" && len(ret) < max {
+		var s string
+		s, remain, _ = strings.Cut(remain, ",")
+		addr, err := netip.ParseAddr(s)
+		if err != nil {
+			log.Printf("ignoring invalid Addr %q in TS_DEBUG_RELAY_SERVER_ADDRS %q: %v", s, all, err)
+			continue
 		}
-	}()
-	for {
-		select {
-		case <-e.disconnectFromBusCh:
-			return
-		case <-reqSub.Done():
-			// If reqSub is done, the eventClient has been closed, which is a
-			// signal to return.
-			return
-		case req := <-reqSub.Events():
-			if rs == nil {
-				var err error
-				rs, err = udprelay.NewServer(e.logf, port, nil)
-				if err != nil {
-					e.logf("error initializing server: %v", err)
+		ret = append(ret, addr)
+	}
+	return
+})
+
+// consumeEventbusTopics serves endpoint allocation requests over the eventbus.
+// It also serves [relayServer] debug information on a channel.
+// consumeEventbusTopics must never acquire [extension.mu], which can be held
+// by other goroutines while waiting to receive on [extension.eventSubs] or the
+// inner [extension.debugSessionsCh] channel.
+func (e *extension) consumeEventbusTopics(ec *eventbus.Client, port int) func(*eventbus.Client) {
+	reqSub := eventbus.Subscribe[magicsock.UDPRelayAllocReq](ec)
+	respPub := eventbus.Publish[magicsock.UDPRelayAllocResp](ec)
+	debugSessionsCh := e.debugSessionsCh
+
+	return func(ec *eventbus.Client) {
+		rs, err := udprelay.NewServer(e.logf, port, overrideAddrs())
+		if err != nil {
+			e.logf("error initializing server: %v", err)
+		}
+
+		defer func() {
+			if rs != nil {
+				rs.Close()
+			}
+		}()
+		for {
+			select {
+			case <-ec.Done():
+				return
+			case respCh := <-debugSessionsCh:
+				if rs == nil {
+					respCh <- nil
 					continue
 				}
-			}
-			se, err := rs.AllocateEndpoint(req.Message.ClientDisco[0], req.Message.ClientDisco[1])
-			if err != nil {
-				e.logf("error allocating endpoint: %v", err)
-				continue
-			}
-			respPub.Publish(magicsock.UDPRelayAllocResp{
-				ReqRxFromNodeKey:  req.RxFromNodeKey,
-				ReqRxFromDiscoKey: req.RxFromDiscoKey,
-				Message: &disco.AllocateUDPRelayEndpointResponse{
-					Generation: req.Message.Generation,
-					UDPRelayEndpoint: disco.UDPRelayEndpoint{
-						ServerDisco:         se.ServerDisco,
-						ClientDisco:         se.ClientDisco,
-						LamportID:           se.LamportID,
-						VNI:                 se.VNI,
-						BindLifetime:        se.BindLifetime.Duration,
-						SteadyStateLifetime: se.SteadyStateLifetime.Duration,
-						AddrPorts:           se.AddrPorts,
+				sessions := rs.GetSessions()
+				respCh <- sessions
+			case req := <-reqSub.Events():
+				if rs == nil {
+					// The server may have previously failed to initialize if
+					// the configured port was in use, try again.
+					rs, err = udprelay.NewServer(e.logf, port, overrideAddrs())
+					if err != nil {
+						e.logf("error initializing server: %v", err)
+						continue
+					}
+				}
+				se, err := rs.AllocateEndpoint(req.Message.ClientDisco[0], req.Message.ClientDisco[1])
+				if err != nil {
+					e.logf("error allocating endpoint: %v", err)
+					continue
+				}
+				respPub.Publish(magicsock.UDPRelayAllocResp{
+					ReqRxFromNodeKey:  req.RxFromNodeKey,
+					ReqRxFromDiscoKey: req.RxFromDiscoKey,
+					Message: &disco.AllocateUDPRelayEndpointResponse{
+						Generation: req.Message.Generation,
+						UDPRelayEndpoint: disco.UDPRelayEndpoint{
+							ServerDisco:         se.ServerDisco,
+							ClientDisco:         se.ClientDisco,
+							LamportID:           se.LamportID,
+							VNI:                 se.VNI,
+							BindLifetime:        se.BindLifetime.Duration,
+							SteadyStateLifetime: se.SteadyStateLifetime.Duration,
+							AddrPorts:           se.AddrPorts,
+						},
 					},
-				},
-			})
+				})
+			}
 		}
 	}
 }
 
 func (e *extension) disconnectFromBusLocked() {
-	if e.busDoneCh != nil {
-		close(e.disconnectFromBusCh)
-		<-e.busDoneCh
-		e.busDoneCh = nil
-		e.disconnectFromBusCh = nil
+	if e.eventSubs != nil {
+		e.eventSubs.Close()
+		e.eventSubs = nil
+		e.debugSessionsCh = nil
 	}
 }
 
@@ -187,4 +245,31 @@ func (e *extension) Shutdown() error {
 	e.disconnectFromBusLocked()
 	e.shutdown = true
 	return nil
+}
+
+// serverStatus gathers and returns current peer relay server status information
+// for this Tailscale node, and status of each peer relay session this node is
+// relaying (if any).
+func (e *extension) serverStatus() status.ServerStatus {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	st := status.ServerStatus{
+		UDPPort:  nil,
+		Sessions: nil,
+	}
+	if e.port == nil || e.eventSubs == nil {
+		return st
+	}
+	st.UDPPort = ptr.To(*e.port)
+
+	ch := make(chan []status.ServerSession)
+	select {
+	case e.debugSessionsCh <- ch:
+		resp := <-ch
+		st.Sessions = resp
+		return st
+	case <-e.eventSubs.Done():
+		return st
+	}
 }

@@ -44,6 +44,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"tailscale.com/envknob"
 
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale"
@@ -65,6 +66,9 @@ import (
 
 // Generate static manifests for deploying Tailscale operator on Kubernetes from the operator's Helm chart.
 //go:generate go run tailscale.com/cmd/k8s-operator/generate staticmanifests
+
+// Generate the helm chart's CRDs (which are ignored from git).
+//go:generate go run tailscale.com/cmd/k8s-operator/generate helmcrd
 
 // Generate CRD API docs.
 //go:generate go run github.com/elastic/crd-ref-docs --renderer=markdown --source-path=../../k8s-operator/apis/ --config=../../k8s-operator/api-docs-config.yaml --output-path=../../k8s-operator/api.md
@@ -133,6 +137,14 @@ func main() {
 			}
 		}()
 	}
+
+	// Operator log uploads can be opted-out using the "TS_NO_LOGS_NO_SUPPORT" environment variable.
+	if !envknob.NoLogsNoSupport() {
+		zlog = zlog.WithOptions(zap.WrapCore(func(core zapcore.Core) zapcore.Core {
+			return wrapZapCore(core, s.LogtailWriter())
+		}))
+	}
+
 	rOpts := reconcilerOpts{
 		log:                           zlog,
 		tsServer:                      s,

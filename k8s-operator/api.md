@@ -213,7 +213,6 @@ NB: if you want cluster workloads to be able to refer to Tailscale Ingress
 using its MagicDNS name, you must also annotate the Ingress resource with
 tailscale.com/experimental-forward-cluster-traffic-via-ingress annotation to
 ensure that the proxy created for the Ingress listens on its Pod IP address.
-NB: Clusters where Pods get assigned IPv6 addresses only are currently not supported.
 
 
 
@@ -444,6 +443,8 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `image` _[NameserverImage](#nameserverimage)_ | Nameserver image. Defaults to tailscale/k8s-nameserver:unstable. |  |  |
 | `service` _[NameserverService](#nameserverservice)_ | Service configuration. |  |  |
+| `pod` _[NameserverPod](#nameserverpod)_ | Pod configuration. |  |  |
+| `replicas` _integer_ | Replicas specifies how many Pods to create. Defaults to 1. |  | Minimum: 0 <br /> |
 
 
 #### NameserverImage
@@ -461,6 +462,22 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `repo` _string_ | Repo defaults to tailscale/k8s-nameserver. |  |  |
 | `tag` _string_ | Tag defaults to unstable. |  |  |
+
+
+#### NameserverPod
+
+
+
+
+
+
+
+_Appears in:_
+- [Nameserver](#nameserver)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `tolerations` _[Toleration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#toleration-v1-core) array_ | If specified, applies tolerations to the pods deployed by the DNSConfig resource. |  |  |
 
 
 #### NameserverService
@@ -537,6 +554,8 @@ _Appears in:_
 | `tolerations` _[Toleration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#toleration-v1-core) array_ | Proxy Pod's tolerations.<br />By default Tailscale Kubernetes operator does not apply any<br />tolerations.<br />https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#scheduling |  |  |
 | `topologySpreadConstraints` _[TopologySpreadConstraint](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#topologyspreadconstraint-v1-core) array_ | Proxy Pod's topology spread constraints.<br />By default Tailscale Kubernetes operator does not apply any topology spread constraints.<br />https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/ |  |  |
 | `priorityClassName` _string_ | PriorityClassName for the proxy Pod.<br />By default Tailscale Kubernetes operator does not apply any priority class.<br />https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#scheduling |  |  |
+| `dnsPolicy` _[DNSPolicy](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#dnspolicy-v1-core)_ | DNSPolicy defines how DNS will be configured for the proxy Pod.<br />By default the Tailscale Kubernetes Operator does not set a DNS policy (uses cluster default).<br />https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/#pod-s-dns-policy |  | Enum: [ClusterFirstWithHostNet ClusterFirst Default None] <br /> |
+| `dnsConfig` _[PodDNSConfig](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#poddnsconfig-v1-core)_ | DNSConfig defines DNS parameters for the proxy Pod in addition to those generated from DNSPolicy.<br />When DNSPolicy is set to "None", DNSConfig must be specified.<br />https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/#pod-dns-config |  |  |
 
 
 #### PortRange

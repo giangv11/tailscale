@@ -12,7 +12,8 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"tailscale.com/clientupdate"
+	_ "tailscale.com/clientupdate" // for feature registration side effects
+	"tailscale.com/feature"
 	"tailscale.com/health"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/mem"
@@ -20,13 +21,14 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/persist"
+	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/util/must"
 )
 
 func TestProfileCurrentUserSwitch(t *testing.T) {
 	store := new(mem.Store)
 
-	pm, err := newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "linux")
+	pm, err := newProfileManagerWithGOOS(store, logger.Discard, health.NewTracker(eventbustest.NewBus(t)), "linux")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +65,7 @@ func TestProfileCurrentUserSwitch(t *testing.T) {
 		t.Fatalf("CurrentPrefs() = %v, want emptyPrefs", pm.CurrentPrefs().Pretty())
 	}
 
-	pm, err = newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "linux")
+	pm, err = newProfileManagerWithGOOS(store, logger.Discard, health.NewTracker(eventbustest.NewBus(t)), "linux")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +83,7 @@ func TestProfileCurrentUserSwitch(t *testing.T) {
 func TestProfileList(t *testing.T) {
 	store := new(mem.Store)
 
-	pm, err := newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "linux")
+	pm, err := newProfileManagerWithGOOS(store, logger.Discard, health.NewTracker(eventbustest.NewBus(t)), "linux")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,6 +151,7 @@ func TestProfileDupe(t *testing.T) {
 				ID:        tailcfg.UserID(user),
 				LoginName: fmt.Sprintf("user%d@example.com", user),
 			},
+			AttestationKey: nil,
 		}
 	}
 	user1Node1 := newPersist(1, 1)
@@ -285,7 +288,7 @@ func TestProfileDupe(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			store := new(mem.Store)
-			pm, err := newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "linux")
+			pm, err := newProfileManagerWithGOOS(store, logger.Discard, health.NewTracker(eventbustest.NewBus(t)), "linux")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -318,7 +321,7 @@ func TestProfileDupe(t *testing.T) {
 func TestProfileManagement(t *testing.T) {
 	store := new(mem.Store)
 
-	pm, err := newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "linux")
+	pm, err := newProfileManagerWithGOOS(store, logger.Discard, health.NewTracker(eventbustest.NewBus(t)), "linux")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,7 +419,7 @@ func TestProfileManagement(t *testing.T) {
 	t.Logf("Recreate profile manager from store")
 	// Recreate the profile manager to ensure that it can load the profiles
 	// from the store at startup.
-	pm, err = newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "linux")
+	pm, err = newProfileManagerWithGOOS(store, logger.Discard, health.NewTracker(eventbustest.NewBus(t)), "linux")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -432,7 +435,7 @@ func TestProfileManagement(t *testing.T) {
 	t.Logf("Recreate profile manager from store after deleting default profile")
 	// Recreate the profile manager to ensure that it can load the profiles
 	// from the store at startup.
-	pm, err = newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "linux")
+	pm, err = newProfileManagerWithGOOS(store, logger.Discard, health.NewTracker(eventbustest.NewBus(t)), "linux")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -463,7 +466,7 @@ func TestProfileManagement(t *testing.T) {
 	wantCurProfile = "user@2.example.com"
 	checkProfiles(t)
 
-	if !clientupdate.CanAutoUpdate() {
+	if !feature.CanAutoUpdate() {
 		t.Logf("Save an invalid AutoUpdate pref value")
 		prefs := pm.CurrentPrefs().AsStruct()
 		prefs.AutoUpdate.Apply.Set(true)
@@ -474,7 +477,7 @@ func TestProfileManagement(t *testing.T) {
 			t.Fatal("SetPrefs failed to save auto-update setting")
 		}
 		// Re-load profiles to trigger migration for invalid auto-update value.
-		pm, err = newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "linux")
+		pm, err = newProfileManagerWithGOOS(store, logger.Discard, health.NewTracker(eventbustest.NewBus(t)), "linux")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -496,7 +499,7 @@ func TestProfileManagementWindows(t *testing.T) {
 
 	store := new(mem.Store)
 
-	pm, err := newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "windows")
+	pm, err := newProfileManagerWithGOOS(store, logger.Discard, health.NewTracker(eventbustest.NewBus(t)), "windows")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -565,7 +568,7 @@ func TestProfileManagementWindows(t *testing.T) {
 	t.Logf("Recreate profile manager from store, should reset prefs")
 	// Recreate the profile manager to ensure that it can load the profiles
 	// from the store at startup.
-	pm, err = newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "windows")
+	pm, err = newProfileManagerWithGOOS(store, logger.Discard, health.NewTracker(eventbustest.NewBus(t)), "windows")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -588,7 +591,7 @@ func TestProfileManagementWindows(t *testing.T) {
 	}
 
 	// Recreate the profile manager to ensure that it starts with test profile.
-	pm, err = newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "windows")
+	pm, err = newProfileManagerWithGOOS(store, logger.Discard, health.NewTracker(eventbustest.NewBus(t)), "windows")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1091,7 +1094,7 @@ func TestProfileStateChangeCallback(t *testing.T) {
 			t.Parallel()
 
 			store := new(mem.Store)
-			pm, err := newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "linux")
+			pm, err := newProfileManagerWithGOOS(store, logger.Discard, health.NewTracker(eventbustest.NewBus(t)), "linux")
 			if err != nil {
 				t.Fatalf("newProfileManagerWithGOOS: %v", err)
 			}

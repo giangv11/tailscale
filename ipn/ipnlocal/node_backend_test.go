@@ -9,11 +9,15 @@ import (
 	"testing"
 	"time"
 
+	"tailscale.com/tailcfg"
+	"tailscale.com/tstest"
+	"tailscale.com/types/netmap"
+	"tailscale.com/types/ptr"
 	"tailscale.com/util/eventbus"
 )
 
 func TestNodeBackendReadiness(t *testing.T) {
-	nb := newNodeBackend(t.Context(), eventbus.New())
+	nb := newNodeBackend(t.Context(), tstest.WhileTestRunningLogger(t), eventbus.New())
 
 	// The node backend is not ready until [nodeBackend.ready] is called,
 	// and [nodeBackend.Wait] should fail with [context.DeadlineExceeded].
@@ -44,7 +48,7 @@ func TestNodeBackendReadiness(t *testing.T) {
 }
 
 func TestNodeBackendShutdown(t *testing.T) {
-	nb := newNodeBackend(t.Context(), eventbus.New())
+	nb := newNodeBackend(t.Context(), tstest.WhileTestRunningLogger(t), eventbus.New())
 
 	shutdownCause := errors.New("test shutdown")
 
@@ -82,7 +86,7 @@ func TestNodeBackendShutdown(t *testing.T) {
 }
 
 func TestNodeBackendReadyAfterShutdown(t *testing.T) {
-	nb := newNodeBackend(t.Context(), eventbus.New())
+	nb := newNodeBackend(t.Context(), tstest.WhileTestRunningLogger(t), eventbus.New())
 
 	shutdownCause := errors.New("test shutdown")
 	nb.shutdown(shutdownCause)
@@ -94,7 +98,7 @@ func TestNodeBackendReadyAfterShutdown(t *testing.T) {
 
 func TestNodeBackendParentContextCancellation(t *testing.T) {
 	ctx, cancelCtx := context.WithCancel(context.Background())
-	nb := newNodeBackend(ctx, eventbus.New())
+	nb := newNodeBackend(ctx, tstest.WhileTestRunningLogger(t), eventbus.New())
 
 	cancelCtx()
 
@@ -111,7 +115,7 @@ func TestNodeBackendParentContextCancellation(t *testing.T) {
 }
 
 func TestNodeBackendConcurrentReadyAndShutdown(t *testing.T) {
-	nb := newNodeBackend(t.Context(), eventbus.New())
+	nb := newNodeBackend(t.Context(), tstest.WhileTestRunningLogger(t), eventbus.New())
 
 	// Calling [nodeBackend.ready] and [nodeBackend.shutdown] concurrently
 	// should not cause issues, and [nodeBackend.Wait] should unblock,
@@ -120,4 +124,69 @@ func TestNodeBackendConcurrentReadyAndShutdown(t *testing.T) {
 	go nb.shutdown(errors.New("test shutdown"))
 
 	nb.Wait(context.Background())
+}
+
+func TestNodeBackendReachability(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+
+		// Cap sets [tailcfg.NodeAttrClientSideReachability] on the self
+		// node.
+		//
+		// When disabled, the client relies on the control plane sending
+		// an accurate peer.Online flag. When enabled, the client
+		// ignores peer.Online and determines whether it can reach the
+		// peer node.
+		cap bool
+
+		peer tailcfg.Node
+		want bool
+	}{
+		{
+			name: "disabled/offline",
+			cap:  false,
+			peer: tailcfg.Node{
+				Online: ptr.To(false),
+			},
+			want: false,
+		},
+		{
+			name: "disabled/online",
+			cap:  false,
+			peer: tailcfg.Node{
+				Online: ptr.To(true),
+			},
+			want: true,
+		},
+		{
+			name: "enabled/offline",
+			cap:  true,
+			peer: tailcfg.Node{
+				Online: ptr.To(false),
+			},
+			want: true,
+		},
+		{
+			name: "enabled/online",
+			cap:  true,
+			peer: tailcfg.Node{
+				Online: ptr.To(true),
+			},
+			want: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nb := newNodeBackend(t.Context(), tstest.WhileTestRunningLogger(t), eventbus.New())
+			nb.netMap = &netmap.NetworkMap{}
+			if tc.cap {
+				nb.netMap.AllCaps.Make()
+				nb.netMap.AllCaps.Add(tailcfg.NodeAttrClientSideReachability)
+			}
+
+			got := nb.PeerIsReachable(t.Context(), tc.peer.View())
+			if got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
 }

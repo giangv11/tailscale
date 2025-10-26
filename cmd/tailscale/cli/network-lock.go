@@ -1,6 +1,8 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+//go:build !ts_omit_tailnetlock
+
 package cli
 
 import (
@@ -26,6 +28,10 @@ import (
 	"tailscale.com/types/tkatype"
 	"tailscale.com/util/prompt"
 )
+
+func init() {
+	maybeNetlockCmd = func() *ffcli.Command { return netlockCmd }
+}
 
 var netlockCmd = &ffcli.Command{
 	Name:       "lock",
@@ -219,18 +225,18 @@ func runNetworkLockStatus(ctx context.Context, args []string) error {
 	}
 
 	if st.Enabled {
-		fmt.Println("Tailnet lock is ENABLED.")
+		fmt.Println("Tailnet Lock is ENABLED.")
 	} else {
-		fmt.Println("Tailnet lock is NOT enabled.")
+		fmt.Println("Tailnet Lock is NOT enabled.")
 	}
 	fmt.Println()
 
 	if st.Enabled && st.NodeKey != nil && !st.PublicKey.IsZero() {
 		if st.NodeKeySigned {
-			fmt.Println("This node is accessible under tailnet lock. Node signature:")
+			fmt.Println("This node is accessible under Tailnet Lock. Node signature:")
 			fmt.Println(st.NodeKeySignature.String())
 		} else {
-			fmt.Println("This node is LOCKED OUT by tailnet-lock, and action is required to establish connectivity.")
+			fmt.Println("This node is LOCKED OUT by Tailnet Lock, and action is required to establish connectivity.")
 			fmt.Printf("Run the following command on a node with a trusted key:\n\ttailscale lock sign %v %s\n", st.NodeKey, st.PublicKey.CLIString())
 		}
 		fmt.Println()
@@ -378,7 +384,7 @@ Removal of a signing key(s) without resigning nodes (--re-sign=false)
 will cause any nodes signed by the the given key(s) to be locked out
 of the Tailscale network. Proceed with caution.
 `)
-			if !prompt.YesNo("Are you sure you want to remove the signing key(s)?") {
+			if !prompt.YesNo("Are you sure you want to remove the signing key(s)?", true) {
 				fmt.Printf("aborting removal of signing key(s)\n")
 				os.Exit(0)
 			}
@@ -684,6 +690,14 @@ func nlDescribeUpdate(update ipnstate.NetworkLockUpdate, color bool) (string, er
 }
 
 func runNetworkLockLog(ctx context.Context, args []string) error {
+	st, err := localClient.NetworkLockStatus(ctx)
+	if err != nil {
+		return fixTailscaledConnectError(err)
+	}
+	if !st.Enabled {
+		return errors.New("Tailnet Lock is not enabled")
+	}
+
 	updates, err := localClient.NetworkLockLog(ctx, nlLogArgs.limit)
 	if err != nil {
 		return fixTailscaledConnectError(err)

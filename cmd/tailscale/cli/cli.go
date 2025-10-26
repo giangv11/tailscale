@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"text/tabwriter"
+	"time"
 
 	"github.com/mattn/go-colorable"
 	"github.com/mattn/go-isatty"
@@ -25,6 +26,7 @@ import (
 	"tailscale.com/client/local"
 	"tailscale.com/cmd/tailscale/cli/ffcomplete"
 	"tailscale.com/envknob"
+	"tailscale.com/feature"
 	"tailscale.com/paths"
 	"tailscale.com/util/slicesx"
 	"tailscale.com/version/distro"
@@ -207,9 +209,17 @@ func noDupFlagify(c *ffcli.Command) {
 	}
 }
 
-var fileCmd func() *ffcli.Command
-var sysPolicyCmd func() *ffcli.Command
-var maybeWebCmd func() *ffcli.Command
+var (
+	fileCmd,
+	sysPolicyCmd,
+	maybeWebCmd,
+	maybeDriveCmd,
+	maybeNetlockCmd,
+	maybeFunnelCmd,
+	maybeServeCmd,
+	maybeCertCmd,
+	_ func() *ffcli.Command
+)
 
 func newRootCmd() *ffcli.Command {
 	rootfs := newFlagSet("tailscale")
@@ -249,23 +259,24 @@ change in the future.
 			pingCmd,
 			ncCmd,
 			sshCmd,
-			funnelCmd(),
-			serveCmd(),
+			nilOrCall(maybeFunnelCmd),
+			nilOrCall(maybeServeCmd),
 			versionCmd,
 			nilOrCall(maybeWebCmd),
 			nilOrCall(fileCmd),
 			bugReportCmd,
-			certCmd,
-			netlockCmd,
+			nilOrCall(maybeCertCmd),
+			nilOrCall(maybeNetlockCmd),
 			licensesCmd,
 			exitNodeCmd(),
 			updateCmd,
 			whoisCmd,
 			debugCmd(),
-			driveCmd,
+			nilOrCall(maybeDriveCmd),
 			idTokenCmd,
 			configureHostCmd(),
 			systrayCmd,
+			appcRoutesCmd,
 		),
 		FlagSet: rootfs,
 		Exec: func(ctx context.Context, args []string) error {
@@ -529,4 +540,29 @@ func jsonDocsWalk(cmd *ffcli.Command) *commandDoc {
 		}
 	}
 	return res
+}
+
+func lastSeenFmt(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	d := max(time.Since(t), time.Minute) // at least 1 minute
+
+	switch {
+	case d < time.Hour:
+		return fmt.Sprintf(", last seen %dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf(", last seen %dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf(", last seen %dd ago", int(d.Hours()/24))
+	}
+}
+
+var hookFixTailscaledConnectError feature.Hook[func(error) error] // for cliconndiag
+
+func fixTailscaledConnectError(origErr error) error {
+	if f, ok := hookFixTailscaledConnectError.GetOk(); ok {
+		return f(origErr)
+	}
+	return origErr
 }

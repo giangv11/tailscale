@@ -104,11 +104,12 @@ func newIPN(jsConfig js.Value) map[string]any {
 	sys := tsd.NewSystem()
 	sys.Set(store)
 	dialer := &tsdial.Dialer{Logf: logf}
+	dialer.SetBus(sys.Bus.Get())
 	eng, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
 		Dialer:        dialer,
 		SetSubsystem:  sys.Set,
 		ControlKnobs:  sys.ControlKnobs(),
-		HealthTracker: sys.HealthTracker(),
+		HealthTracker: sys.HealthTracker.Get(),
 		Metrics:       sys.UserMetricsRegistry(),
 		EventBus:      sys.Bus.Get(),
 	})
@@ -138,7 +139,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 	sys.Tun.Get().Start()
 
 	logid := lpc.PublicID
-	srv := ipnserver.New(logf, logid, sys.NetMon.Get())
+	srv := ipnserver.New(logf, logid, sys.Bus.Get(), sys.NetMon.Get())
 	lb, err := ipnlocal.NewLocalBackend(logf, logid, sys, controlclient.LoginEphemeral)
 	if err != nil {
 		log.Fatalf("ipnlocal.NewLocalBackend: %v", err)
@@ -463,7 +464,6 @@ func (s *jsSSHSession) Run() {
 		cols = s.pendingResizeCols
 	}
 	err = session.RequestPty("xterm", rows, cols, ssh.TerminalModes{})
-
 	if err != nil {
 		writeError("Pseudo Terminal", err)
 		return

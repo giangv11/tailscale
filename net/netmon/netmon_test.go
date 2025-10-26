@@ -7,6 +7,7 @@ import (
 	"flag"
 	"net"
 	"net/netip"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -81,7 +82,7 @@ func TestMonitorInjectEventOnBus(t *testing.T) {
 
 	mon.Start()
 	mon.InjectEvent()
-	if err := eventbustest.Expect(tw, eventbustest.Type[*ChangeDelta]()); err != nil {
+	if err := eventbustest.Expect(tw, eventbustest.Type[ChangeDelta]()); err != nil {
 		t.Error(err)
 	}
 }
@@ -143,7 +144,7 @@ func TestMonitorMode(t *testing.T) {
 		<-done
 		t.Logf("%v callbacks", n)
 	case "eventbus":
-		tw.TimeOut = *monitorDuration
+		time.AfterFunc(*monitorDuration, bus.Close)
 		n := 0
 		mon.Start()
 		eventbustest.Expect(tw, func(event *ChangeDelta) (bool, error) {
@@ -263,6 +264,45 @@ func TestIsMajorChangeFrom(t *testing.T) {
 			}
 			if got := m.IsMajorChangeFrom(tt.s1, tt.s2); got != tt.want {
 				t.Errorf("IsMajorChange = %v; want %v", got, tt.want)
+			}
+		})
+	}
+}
+func TestForeachInterface(t *testing.T) {
+	tests := []struct {
+		name  string
+		addrs []net.Addr
+		want  []string
+	}{
+		{
+			name: "Mixed_IPv4_and_IPv6",
+			addrs: []net.Addr{
+				&net.IPNet{IP: net.IPv4(1, 2, 3, 4), Mask: net.CIDRMask(24, 32)},
+				&net.IPAddr{IP: net.IP{5, 6, 7, 8}, Zone: ""},
+				&net.IPNet{IP: net.ParseIP("2001:db8::1"), Mask: net.CIDRMask(64, 128)},
+				&net.IPAddr{IP: net.ParseIP("2001:db8::2"), Zone: ""},
+			},
+			want: []string{"1.2.3.4", "5.6.7.8", "2001:db8::1", "2001:db8::2"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got []string
+			ifaces := InterfaceList{
+				{
+					Interface: &net.Interface{Name: "eth0"},
+					AltAddrs:  tt.addrs,
+				},
+			}
+			ifaces.ForeachInterface(func(iface Interface, prefixes []netip.Prefix) {
+				for _, prefix := range prefixes {
+					ip := prefix.Addr()
+					got = append(got, ip.String())
+				}
+			})
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("got %q, want %q", got, tt.want)
 			}
 		})
 	}

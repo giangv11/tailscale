@@ -27,10 +27,12 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 	"unsafe"
 
 	qt "github.com/frankban/quicktest"
+	"github.com/google/go-cmp/cmp"
 	wgconn "github.com/tailscale/wireguard-go/conn"
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun/tuntest"
@@ -39,13 +41,11 @@ import (
 	"golang.org/x/net/ipv4"
 	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/control/controlknobs"
-	"tailscale.com/derp"
-	"tailscale.com/derp/derphttp"
+	"tailscale.com/derp/derpserver"
 	"tailscale.com/disco"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
 	"tailscale.com/ipn/ipnstate"
-	"tailscale.com/net/connstats"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/netcheck"
 	"tailscale.com/net/netmon"
@@ -67,6 +67,7 @@ import (
 	"tailscale.com/util/cibuild"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/eventbus"
+	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/util/must"
 	"tailscale.com/util/racebuild"
 	"tailscale.com/util/set"
@@ -111,9 +112,9 @@ func (c *Conn) WaitReady(t testing.TB) {
 }
 
 func runDERPAndStun(t *testing.T, logf logger.Logf, l nettype.PacketListener, stunIP netip.Addr) (derpMap *tailcfg.DERPMap, cleanup func()) {
-	d := derp.NewServer(key.NewNode(), logf)
+	d := derpserver.New(key.NewNode(), logf)
 
-	httpsrv := httptest.NewUnstartedServer(derphttp.Handler(d))
+	httpsrv := httptest.NewUnstartedServer(derpserver.Handler(d))
 	httpsrv.Config.ErrorLog = logger.StdLogger(logf)
 	httpsrv.Config.TLSNextProto = make(map[string]func(*http.Server, *tls.Conn, http.Handler))
 	httpsrv.StartTLS()
@@ -157,14 +158,14 @@ func runDERPAndStun(t *testing.T, logf logger.Logf, l nettype.PacketListener, st
 // happiness.
 type magicStack struct {
 	privateKey key.NodePrivate
-	epCh       chan []tailcfg.Endpoint // endpoint updates produced by this peer
-	stats      *connstats.Statistics   // per-connection statistics
-	conn       *Conn                   // the magicsock itself
-	tun        *tuntest.ChannelTUN     // TUN device to send/receive packets
-	tsTun      *tstun.Wrapper          // wrapped tun that implements filtering and wgengine hooks
-	dev        *device.Device          // the wireguard-go Device that connects the previous things
-	wgLogger   *wglog.Logger           // wireguard-go log wrapper
-	netMon     *netmon.Monitor         // always non-nil
+	epCh       chan []tailcfg.Endpoint       // endpoint updates produced by this peer
+	counts     netlogtype.CountsByConnection // per-connection statistics
+	conn       *Conn                         // the magicsock itself
+	tun        *tuntest.ChannelTUN           // TUN device to send/receive packets
+	tsTun      *tstun.Wrapper                // wrapped tun that implements filtering and wgengine hooks
+	dev        *device.Device                // the wireguard-go Device that connects the previous things
+	wgLogger   *wglog.Logger                 // wireguard-go log wrapper
+	netMon     *netmon.Monitor               // always non-nil
 	metrics    *usermetric.Registry
 }
 
@@ -179,14 +180,13 @@ func newMagicStack(t testing.TB, logf logger.Logf, l nettype.PacketListener, der
 func newMagicStackWithKey(t testing.TB, logf logger.Logf, l nettype.PacketListener, derpMap *tailcfg.DERPMap, privateKey key.NodePrivate) *magicStack {
 	t.Helper()
 
-	bus := eventbus.New()
-	t.Cleanup(bus.Close)
+	bus := eventbustest.NewBus(t)
 
 	netMon, err := netmon.New(bus, logf)
 	if err != nil {
 		t.Fatalf("netmon.New: %v", err)
 	}
-	ht := new(health.Tracker)
+	ht := health.NewTracker(bus)
 
 	var reg usermetric.Registry
 	epCh := make(chan []tailcfg.Endpoint, 100) // arbitrary
@@ -1143,22 +1143,19 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 		}
 	}
 
-	m1.stats = connstats.NewStatistics(0, 0, nil)
-	defer m1.stats.Shutdown(context.Background())
-	m1.conn.SetStatistics(m1.stats)
-	m2.stats = connstats.NewStatistics(0, 0, nil)
-	defer m2.stats.Shutdown(context.Background())
-	m2.conn.SetStatistics(m2.stats)
+	m1.conn.SetConnectionCounter(m1.counts.Add)
+	m2.conn.SetConnectionCounter(m2.counts.Add)
 
 	checkStats := func(t *testing.T, m *magicStack, wantConns []netlogtype.Connection) {
-		_, stats := m.stats.TestExtract()
+		defer m.counts.Reset()
+		counts := m.counts.Clone()
 		for _, conn := range wantConns {
-			if _, ok := stats[conn]; ok {
+			if _, ok := counts[conn]; ok {
 				return
 			}
 		}
 		t.Helper()
-		t.Errorf("missing any connection to %s from %s", wantConns, slicesx.MapKeys(stats))
+		t.Errorf("missing any connection to %s from %s", wantConns, slicesx.MapKeys(counts))
 	}
 
 	addrPort := netip.MustParseAddrPort
@@ -1221,9 +1218,9 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 		setT(t)
 		defer setT(outerT)
 		m1.conn.resetMetricsForTest()
-		m1.stats.TestExtract()
+		m1.counts.Reset()
 		m2.conn.resetMetricsForTest()
-		m2.stats.TestExtract()
+		m2.counts.Reset()
 		t.Logf("Metrics before: %s\n", m1.metrics.String())
 		ping1(t)
 		ping2(t)
@@ -1249,8 +1246,6 @@ func (c *Conn) resetMetricsForTest() {
 }
 
 func assertConnStatsAndUserMetricsEqual(t *testing.T, ms *magicStack) {
-	_, phys := ms.stats.TestExtract()
-
 	physIPv4RxBytes := int64(0)
 	physIPv4TxBytes := int64(0)
 	physDERPRxBytes := int64(0)
@@ -1259,7 +1254,7 @@ func assertConnStatsAndUserMetricsEqual(t *testing.T, ms *magicStack) {
 	physIPv4TxPackets := int64(0)
 	physDERPRxPackets := int64(0)
 	physDERPTxPackets := int64(0)
-	for conn, count := range phys {
+	for conn, count := range ms.counts.Clone() {
 		t.Logf("physconn src: %s, dst: %s", conn.Src.String(), conn.Dst.String())
 		if conn.Dst.String() == "127.3.3.40:1" {
 			physDERPRxBytes += int64(count.RxBytes)
@@ -1273,6 +1268,7 @@ func assertConnStatsAndUserMetricsEqual(t *testing.T, ms *magicStack) {
 			physIPv4TxPackets += int64(count.TxPackets)
 		}
 	}
+	ms.counts.Reset()
 
 	metricIPv4RxBytes := ms.conn.metrics.inboundBytesIPv4Total.Value()
 	metricIPv4RxPackets := ms.conn.metrics.inboundPacketsIPv4Total.Value()
@@ -1300,8 +1296,14 @@ func assertConnStatsAndUserMetricsEqual(t *testing.T, ms *magicStack) {
 	// the metrics by 2 to get the expected value.
 	// TODO(kradalby): https://github.com/tailscale/tailscale/issues/13420
 	c.Assert(metricSendUDP.Value(), qt.Equals, metricIPv4TxPackets*2)
+	c.Assert(metricSendDataPacketsIPv4.Value(), qt.Equals, metricIPv4TxPackets*2)
+	c.Assert(metricSendDataPacketsDERP.Value(), qt.Equals, metricDERPTxPackets*2)
+	c.Assert(metricSendDataBytesIPv4.Value(), qt.Equals, metricIPv4TxBytes*2)
+	c.Assert(metricSendDataBytesDERP.Value(), qt.Equals, metricDERPTxBytes*2)
 	c.Assert(metricRecvDataPacketsIPv4.Value(), qt.Equals, metricIPv4RxPackets*2)
 	c.Assert(metricRecvDataPacketsDERP.Value(), qt.Equals, metricDERPRxPackets*2)
+	c.Assert(metricRecvDataBytesIPv4.Value(), qt.Equals, metricIPv4RxBytes*2)
+	c.Assert(metricRecvDataBytesDERP.Value(), qt.Equals, metricDERPRxBytes*2)
 }
 
 // tests that having a endpoint.String prevents wireguard-go's
@@ -1352,8 +1354,7 @@ func newTestConn(t testing.TB) *Conn {
 	t.Helper()
 	port := pickPort(t)
 
-	bus := eventbus.New()
-	t.Cleanup(bus.Close)
+	bus := eventbustest.NewBus(t)
 
 	netMon, err := netmon.New(bus, logger.WithPrefix(t.Logf, "... netmon: "))
 	if err != nil {
@@ -1364,7 +1365,7 @@ func newTestConn(t testing.TB) *Conn {
 	conn, err := NewConn(Options{
 		NetMon:                 netMon,
 		EventBus:               bus,
-		HealthTracker:          new(health.Tracker),
+		HealthTracker:          health.NewTracker(bus),
 		Metrics:                new(usermetric.Registry),
 		DisablePortMapper:      true,
 		Logf:                   t.Logf,
@@ -3038,7 +3039,7 @@ func TestMaybeSetNearestDERP(t *testing.T) {
 	}
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
-			ht := new(health.Tracker)
+			ht := health.NewTracker(eventbustest.NewBus(t))
 			c := newConn(t.Logf)
 			c.myDerp = tt.old
 			c.derpMap = derpMap
@@ -3116,47 +3117,119 @@ func TestMaybeRebindOnError(t *testing.T) {
 	}
 
 	t.Run("no-frequent-rebind", func(t *testing.T) {
-		if runtime.GOOS != "plan9" {
-			err := fmt.Errorf("outer err: %w", syscall.EPERM)
-			conn := newTestConn(t)
-			defer conn.Close()
-			conn.lastErrRebind.Store(time.Now().Add(-1 * time.Second))
-			before := metricRebindCalls.Value()
-			conn.maybeRebindOnError(err)
-			after := metricRebindCalls.Value()
-			if before != after {
-				t.Errorf("should not rebind within 5 seconds of last")
+		synctest.Test(t, func(t *testing.T) {
+			if runtime.GOOS != "plan9" {
+				err := fmt.Errorf("outer err: %w", syscall.EPERM)
+				conn := newTestConn(t)
+				defer conn.Close()
+				lastRebindTime := time.Now().Add(-1 * time.Second)
+				conn.lastErrRebind.Store(lastRebindTime)
+				before := metricRebindCalls.Value()
+				conn.maybeRebindOnError(err)
+				after := metricRebindCalls.Value()
+				if before != after {
+					t.Errorf("should not rebind within 5 seconds of last")
+				}
+
+				// ensure that rebinds are performed and store an updated last
+				// rebind time.
+				time.Sleep(6 * time.Second)
+
+				conn.maybeRebindOnError(err)
+				newTime := conn.lastErrRebind.Load()
+				if newTime == lastRebindTime {
+					t.Errorf("expected a rebind to occur")
+				}
+				if newTime.Sub(lastRebindTime) < 5*time.Second {
+					t.Errorf("expected at least 5 seconds between %s and %s", lastRebindTime, newTime)
+				}
 			}
-		}
+
+		})
 	})
 }
 
-func TestNetworkDownSendErrors(t *testing.T) {
+func newTestConnAndRegistry(t *testing.T) (*Conn, *usermetric.Registry, func()) {
+	t.Helper()
 	bus := eventbus.New()
-	defer bus.Close()
-
 	netMon := must.Get(netmon.New(bus, t.Logf))
-	defer netMon.Close()
 
 	reg := new(usermetric.Registry)
+
 	conn := must.Get(NewConn(Options{
 		DisablePortMapper: true,
 		Logf:              t.Logf,
 		NetMon:            netMon,
-		Metrics:           reg,
 		EventBus:          bus,
+		Metrics:           reg,
 	}))
-	defer conn.Close()
 
-	conn.SetNetworkUp(false)
-	if err := conn.Send([][]byte{{00}}, &lazyEndpoint{}, 0); err == nil {
-		t.Error("expected error, got nil")
+	return conn, reg, func() {
+		bus.Close()
+		netMon.Close()
+		conn.Close()
 	}
-	resp := httptest.NewRecorder()
-	reg.Handler(resp, new(http.Request))
-	if !strings.Contains(resp.Body.String(), `tailscaled_outbound_dropped_packets_total{reason="error"} 1`) {
-		t.Errorf("expected NetworkDown to increment packet dropped metric; got %q", resp.Body.String())
-	}
+}
+
+func TestNetworkSendErrors(t *testing.T) {
+	t.Run("network-down", func(t *testing.T) {
+		// TODO(alexc): This test case fails on Windows because it never
+		// successfully sends the first packet:
+		//
+		// 	   expected successful Send, got err: "write udp4 0.0.0.0:57516->127.0.0.1:9999:
+		// 	   wsasendto: The requested address is not valid in its context."
+		//
+		// It would be nice to run this test on Windows, but I was already
+		// on a side quest and it was unclear if this test has ever worked
+		// correctly on Windows.
+		if runtime.GOOS == "windows" {
+			t.Skipf("skipping on %s", runtime.GOOS)
+		}
+
+		conn, reg, close := newTestConnAndRegistry(t)
+		defer close()
+
+		buffs := [][]byte{{00, 00, 00, 00, 00, 00, 00, 00}}
+		ep := &lazyEndpoint{
+			src: epAddr{ap: netip.MustParseAddrPort("127.0.0.1:9999")},
+		}
+		offset := 8
+
+		// Check this is a valid payload to send when the network is up
+		conn.SetNetworkUp(true)
+		if err := conn.Send(buffs, ep, offset); err != nil {
+			t.Errorf("expected successful Send, got err: %q", err)
+		}
+
+		// Now we know the payload would be sent if the network is up,
+		// send it again when the network is down
+		conn.SetNetworkUp(false)
+		err := conn.Send(buffs, ep, offset)
+		if err == nil {
+			t.Error("expected error, got nil")
+		}
+		resp := httptest.NewRecorder()
+		reg.Handler(resp, new(http.Request))
+		if !strings.Contains(resp.Body.String(), `tailscaled_outbound_dropped_packets_total{reason="error"} 1`) {
+			t.Errorf("expected NetworkDown to increment packet dropped metric; got %q", resp.Body.String())
+		}
+	})
+
+	t.Run("invalid-payload", func(t *testing.T) {
+		conn, reg, close := newTestConnAndRegistry(t)
+		defer close()
+
+		conn.SetNetworkUp(false)
+		err := conn.Send([][]byte{{00}}, &lazyEndpoint{}, 0)
+		if err == nil {
+			t.Error("expected error, got nil")
+		}
+		resp := httptest.NewRecorder()
+		reg.Handler(resp, new(http.Request))
+		if !strings.Contains(resp.Body.String(), `tailscaled_outbound_dropped_packets_total{reason="error"} 1`) {
+			t.Errorf("expected invalid payload to increment packet dropped metric; got %q", resp.Body.String())
+		}
+	})
 }
 
 func Test_packetLooksLike(t *testing.T) {
@@ -3909,7 +3982,8 @@ func TestConn_receiveIP(t *testing.T) {
 			c.noteRecvActivity = func(public key.NodePublic) {
 				noteRecvActivityCalled = true
 			}
-			c.SetStatistics(connstats.NewStatistics(0, 0, nil))
+			var counts netlogtype.CountsByConnection
+			c.SetConnectionCounter(counts.Add)
 
 			if tt.insertWantEndpointTypeInPeerMap {
 				var insertEPIntoPeerMap *endpoint
@@ -3982,9 +4056,8 @@ func TestConn_receiveIP(t *testing.T) {
 			}
 
 			// Verify physical rx stats
-			stats := c.stats.Load()
-			_, gotPhy := stats.TestExtract()
 			wantNonzeroRxStats := false
+			gotPhy := counts.Clone()
 			switch ep := tt.wantEndpointType.(type) {
 			case *lazyEndpoint:
 				if ep.maybeEP != nil {
@@ -4004,8 +4077,8 @@ func TestConn_receiveIP(t *testing.T) {
 						RxBytes:   wantRxBytes,
 					},
 				}
-				if !reflect.DeepEqual(gotPhy, wantPhy) {
-					t.Errorf("receiveIP() got physical conn stats = %v, want %v", gotPhy, wantPhy)
+				if d := cmp.Diff(gotPhy, wantPhy); d != "" {
+					t.Errorf("receiveIP() stats mismatch (-got +want):\n%s", d)
 				}
 			} else {
 				if len(gotPhy) != 0 {

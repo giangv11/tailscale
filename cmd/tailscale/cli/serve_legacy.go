@@ -1,6 +1,8 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+//go:build !ts_omit_serve
+
 package cli
 
 import (
@@ -30,6 +32,10 @@ import (
 	"tailscale.com/util/slicesx"
 	"tailscale.com/version"
 )
+
+func init() {
+	maybeServeCmd = serveCmd
+}
 
 var serveCmd = func() *ffcli.Command {
 	se := &serveEnv{lc: &localClient}
@@ -166,6 +172,7 @@ type serveEnv struct {
 	yes              bool                // update without prompt
 	service          tailcfg.ServiceName // service name
 	tun              bool                // redirect traffic to OS for service
+	allServices      bool                // apply config file to all services
 
 	lc localServeClient // localClient interface, specific to serve
 

@@ -1,6 +1,8 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+//go:build !ts_omit_serve
+
 package ipnlocal
 
 import (
@@ -13,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -33,6 +36,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/netmap"
+	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/must"
 	"tailscale.com/util/syspolicy/policyclient"
@@ -240,11 +244,15 @@ func TestServeConfigForeground(t *testing.T) {
 
 	err := b.SetServeConfig(&ipn.ServeConfig{
 		Foreground: map[string]*ipn.ServeConfig{
-			session1: {TCP: map[uint16]*ipn.TCPPortHandler{
-				443: {TCPForward: "http://localhost:3000"}},
+			session1: {
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					443: {TCPForward: "http://localhost:3000"},
+				},
 			},
-			session2: {TCP: map[uint16]*ipn.TCPPortHandler{
-				999: {TCPForward: "http://localhost:4000"}},
+			session2: {
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					999: {TCPForward: "http://localhost:4000"},
+				},
 			},
 		},
 	}, "")
@@ -267,8 +275,10 @@ func TestServeConfigForeground(t *testing.T) {
 			5000: {TCPForward: "http://localhost:5000"},
 		},
 		Foreground: map[string]*ipn.ServeConfig{
-			session2: {TCP: map[uint16]*ipn.TCPPortHandler{
-				999: {TCPForward: "http://localhost:4000"}},
+			session2: {
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					999: {TCPForward: "http://localhost:4000"},
+				},
 			},
 		},
 	}, "")
@@ -491,7 +501,6 @@ func TestServeConfigServices(t *testing.T) {
 			}
 		})
 	}
-
 }
 
 func TestServeConfigETag(t *testing.T) {
@@ -659,6 +668,7 @@ func TestServeHTTPProxyPath(t *testing.T) {
 		})
 	}
 }
+
 func TestServeHTTPProxyHeaders(t *testing.T) {
 	b := newTestBackend(t)
 
@@ -859,7 +869,6 @@ func Test_reverseProxyConfiguration(t *testing.T) {
 			wantsURL:      mustCreateURL(t, "https://example3.com"),
 		},
 	})
-
 }
 
 func mustCreateURL(t *testing.T, u string) url.URL {
@@ -873,12 +882,13 @@ func mustCreateURL(t *testing.T, u string) url.URL {
 
 func newTestBackend(t *testing.T, opts ...any) *LocalBackend {
 	var logf logger.Logf = logger.Discard
-	const debug = true
+	const debug = false
 	if debug {
 		logf = logger.WithPrefix(tstest.WhileTestRunningLogger(t), "... ")
 	}
 
-	sys := tsd.NewSystem()
+	bus := eventbustest.NewBus(t)
+	sys := tsd.NewSystemWithBus(bus)
 
 	for _, o := range opts {
 		switch v := o.(type) {
@@ -891,7 +901,7 @@ func newTestBackend(t *testing.T, opts ...any) *LocalBackend {
 
 	e, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
 		SetSubsystem:  sys.Set,
-		HealthTracker: sys.HealthTracker(),
+		HealthTracker: sys.HealthTracker.Get(),
 		Metrics:       sys.UserMetricsRegistry(),
 		EventBus:      sys.Bus.Get(),
 	})
@@ -909,7 +919,7 @@ func newTestBackend(t *testing.T, opts ...any) *LocalBackend {
 	dir := t.TempDir()
 	b.SetVarRoot(dir)
 
-	pm := must.Get(newProfileManager(new(mem.Store), logf, new(health.Tracker)))
+	pm := must.Get(newProfileManager(new(mem.Store), logf, health.NewTracker(bus)))
 	pm.currentProfile = (&ipn.LoginProfile{ID: "id0"}).View()
 	b.pm = pm
 
@@ -952,13 +962,13 @@ func newTestBackend(t *testing.T, opts ...any) *LocalBackend {
 func TestServeFileOrDirectory(t *testing.T) {
 	td := t.TempDir()
 	writeFile := func(suffix, contents string) {
-		if err := os.WriteFile(filepath.Join(td, suffix), []byte(contents), 0600); err != nil {
+		if err := os.WriteFile(filepath.Join(td, suffix), []byte(contents), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
 	writeFile("foo", "this is foo")
 	writeFile("bar", "this is bar")
-	os.MkdirAll(filepath.Join(td, "subdir"), 0700)
+	os.MkdirAll(filepath.Join(td, "subdir"), 0o700)
 	writeFile("subdir/file-a", "this is A")
 	writeFile("subdir/file-b", "this is B")
 	writeFile("subdir/file-c", "this is C")
@@ -1074,5 +1084,90 @@ func TestEncTailscaleHeaderValue(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("encTailscaleHeaderValue(%q) = %q, want %q", tt.in, got, tt.want)
 		}
+	}
+}
+
+func TestServeGRPCProxy(t *testing.T) {
+	const msg = "some-response\n"
+	backend := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Path-Was", r.RequestURI)
+		w.Header().Set("Proto-Was", r.Proto)
+		io.WriteString(w, msg)
+	}))
+	backend.EnableHTTP2 = true
+	backend.Config.Protocols = new(http.Protocols)
+	backend.Config.Protocols.SetHTTP1(true)
+	backend.Config.Protocols.SetUnencryptedHTTP2(true)
+	backend.Start()
+	defer backend.Close()
+
+	backendURL := must.Get(url.Parse(backend.URL))
+
+	lb := newTestBackend(t)
+	rp := &reverseProxy{
+		logf:    t.Logf,
+		url:     backendURL,
+		backend: backend.URL,
+		lb:      lb,
+	}
+
+	req := func(method, urlStr string, opt ...any) *http.Request {
+		req := httptest.NewRequest(method, urlStr, nil)
+		for _, o := range opt {
+			switch v := o.(type) {
+			case int:
+				req.ProtoMajor = v
+			case string:
+				req.Header.Set("Content-Type", v)
+			default:
+				panic(fmt.Sprintf("unsupported option type %T", v))
+			}
+		}
+		return req
+	}
+
+	tests := []struct {
+		name      string
+		req       *http.Request
+		wantPath  string
+		wantProto string
+		wantBody  string
+	}{
+		{
+			name:      "non-gRPC",
+			req:       req("GET", "http://foo/bar"),
+			wantPath:  "/bar",
+			wantProto: "HTTP/1.1",
+		},
+		{
+			name:      "gRPC-but-not-http2",
+			req:       req("GET", "http://foo/bar", "application/grpc"),
+			wantPath:  "/bar",
+			wantProto: "HTTP/1.1",
+		},
+		{
+			name:      "gRPC--http2",
+			req:       req("GET", "http://foo/bar", 2, "application/grpc"),
+			wantPath:  "/bar",
+			wantProto: "HTTP/2.0",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			rp.ServeHTTP(rec, tt.req)
+
+			res := rec.Result()
+			got := must.Get(io.ReadAll(res.Body))
+			if got, want := res.Header.Get("Path-Was"), tt.wantPath; want != got {
+				t.Errorf("Path-Was %q, want %q", got, want)
+			}
+			if got, want := res.Header.Get("Proto-Was"), tt.wantProto; want != got {
+				t.Errorf("Proto-Was %q, want %q", got, want)
+			}
+			if string(got) != msg {
+				t.Errorf("got body %q, want %q", got, msg)
+			}
+		})
 	}
 }
