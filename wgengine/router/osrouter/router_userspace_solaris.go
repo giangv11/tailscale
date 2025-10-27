@@ -4,7 +4,7 @@
 //go:build illumos || solaris
 // +build illumos solaris
 
-package router
+package osrouter
 
 import (
 	"fmt"
@@ -17,7 +17,14 @@ import (
 	"tailscale.com/health"
 	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
+	"tailscale.com/wgengine/router"
 )
+
+func init() {
+	router.HookNewUserspaceRouter.Set(func(opts router.NewOpts) (router.Router, error) {
+		return newUserspaceSunosRouter(opts.Logf, opts.Tun, opts.NetMon, opts.Health)
+	})
+}
 
 type userspaceSunosRouter struct {
 	logf    logger.Logf
@@ -28,7 +35,7 @@ type userspaceSunosRouter struct {
 	routes  map[netip.Prefix]struct{}
 }
 
-func newUserspaceSunosRouter(logf logger.Logf, tundev tun.Device, linkMon *netmon.Monitor, health *health.Tracker) (Router, error) {
+func newUserspaceSunosRouter(logf logger.Logf, tundev tun.Device, linkMon *netmon.Monitor, health *health.Tracker) (router.Router, error) {
 	tunname, err := tundev.Name()
 	if err != nil {
 		return nil, err
@@ -107,7 +114,7 @@ func inet(p netip.Prefix) string {
 	return "inet"
 }
 
-func (r *userspaceSunosRouter) Set(cfg *Config) (reterr error) {
+func (r *userspaceSunosRouter) Set(cfg *router.Config) (reterr error) {
 	if cfg == nil {
 		cfg = &shutdownConfig
 	}
@@ -218,11 +225,6 @@ func (r *userspaceSunosRouter) Set(cfg *Config) (reterr error) {
 	r.routes = newRoutes
 
 	return errq
-}
-
-func (r *userspaceSunosRouter) Close() error {
-	cleanUp(r.logf, r.tunname)
-	return nil
 }
 
 // UpdateMagicsockPort implements the Router interface. This implementation

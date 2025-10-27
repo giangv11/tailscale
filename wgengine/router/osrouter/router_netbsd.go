@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-package router
+package osrouter
 
 import (
 	"errors"
@@ -17,10 +17,18 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/set"
+        "tailscale.com/wgengine/router"
 )
 
-// For now this router only supports the WireGuard userspace implementation.
-// There is an experimental kernel version in the works for OpenBSD:
+func init() {
+	router.HookNewUserspaceRouter.Set(func(opts router.NewOpts) (router.Router, error) {
+		return newUserspaceRouter(opts.Logf, opts.Tun, opts.NetMon, opts.Health, opts.Bus)
+	})
+	router.HookCleanUp.Set(func(logf logger.Logf, netMon *netmon.Monitor, ifName string) {
+		cleanUp(logf, ifName)
+	})
+}
+
 // https://git.zx2c4.com/wireguard-openbsd.
 
 type netbsdRouter struct {
@@ -32,7 +40,7 @@ type netbsdRouter struct {
 	routes  set.Set[netip.Prefix]
 }
 
-func newUserspaceRouter(logf logger.Logf, tundev tun.Device, netMon *netmon.Monitor, health *health.Tracker, bus *eventbus.Bus) (Router, error) {
+func newUserspaceRouter(logf logger.Logf, tundev tun.Device, netMon *netmon.Monitor, health *health.Tracker, bus *eventbus.Bus) (router.Router, error) {
 	tunname, err := tundev.Name()
 	if err != nil {
 		return nil, err
@@ -69,7 +77,7 @@ func inet(p netip.Prefix) string {
 	return "inet"
 }
 
-func (r *netbsdRouter) Set(cfg *Config) error {
+func (r *netbsdRouter) Set(cfg *router.Config) error {
 	if cfg == nil {
 		cfg = &shutdownConfig
 	}
@@ -232,13 +240,6 @@ func (r *netbsdRouter) Set(cfg *Config) error {
 	r.routes = newRoutes
 
 	return errq
-}
-
-// UpdateMagicsockPort implements the Router interface. This implementation
-// does nothing and returns nil because this router does not currently need
-// to know what the magicsock UDP port is.
-func (r *netbsdRouter) UpdateMagicsockPort(_ uint16, _ string) error {
-	return nil
 }
 
 func (r *netbsdRouter) Close() error {

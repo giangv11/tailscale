@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-package router
+package osrouter
 
 import (
 	"strings"
@@ -10,11 +10,12 @@ import (
 	"tailscale.com/health"
 	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
+	"tailscale.com/wgengine/router"
 )
 
 // For now this router only supports the userspace WireGuard implementations.
 
-func newUserspaceRouter(logf logger.Logf, tundev tun.Device, linkMon *netmon.Monitor, health *health.Tracker) (Router, error) {
+func newUserspaceRouter(logf logger.Logf, tundev tun.Device, linkMon *netmon.Monitor, health *health.Tracker) (router.Router, error) {
 	return newUserspaceSunosRouter(logf, tundev, linkMon, health)
 }
 
