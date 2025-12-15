@@ -1282,8 +1282,8 @@ func TestServiceProxyClassAnnotation(t *testing.T) {
 			slist := &corev1.SecretList{}
 			fc.List(context.Background(), slist, client.InNamespace("operator-ns"))
 			for _, i := range slist.Items {
-				l, _ := json.Marshal(i.Labels)
-				t.Logf("found secret %q with labels %q ", i.Name, string(l))
+				labels, _ := json.Marshal(i.Labels)
+				t.Logf("found secret %q with labels %q ", i.Name, string(labels))
 			}
 
 			_, shortName := findGenName(t, fc, "default", "test", "svc")
@@ -1695,6 +1695,42 @@ func Test_serviceHandlerForIngress(t *testing.T) {
 	gotReqs = serviceHandlerForIngress(fc, zl.Sugar(), tailscaleIngressClassName)(context.Background(), someSvc)
 	if len(gotReqs) > 0 {
 		t.Errorf("unexpected reconcile request for a Service that does not belong to any Ingress: %#+v\n", gotReqs)
+	}
+}
+
+func Test_serviceHandlerForIngress_multipleIngressClasses(t *testing.T) {
+	fc := fake.NewFakeClient()
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "backend", Namespace: "default"},
+	}
+	mustCreate(t, fc, svc)
+
+	mustCreate(t, fc, &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{Name: "nginx-ing", Namespace: "default"},
+		Spec: networkingv1.IngressSpec{
+			IngressClassName: ptr.To("nginx"),
+			DefaultBackend:   &networkingv1.IngressBackend{Service: &networkingv1.IngressServiceBackend{Name: "backend"}},
+		},
+	})
+
+	mustCreate(t, fc, &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{Name: "ts-ing", Namespace: "default"},
+		Spec: networkingv1.IngressSpec{
+			IngressClassName: ptr.To("tailscale"),
+			DefaultBackend:   &networkingv1.IngressBackend{Service: &networkingv1.IngressServiceBackend{Name: "backend"}},
+		},
+	})
+
+	got := serviceHandlerForIngress(fc, zl.Sugar(), "tailscale")(context.Background(), svc)
+	want := []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ts-ing"}}}
+
+	if diff := cmp.Diff(got, want); diff != "" {
+		t.Fatalf("unexpected reconcile requests (-got +want):\n%s", diff)
 	}
 }
 

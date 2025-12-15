@@ -149,6 +149,7 @@ type localServeClient interface {
 	IncrementCounter(ctx context.Context, name string, delta int) error
 	GetPrefs(ctx context.Context) (*ipn.Prefs, error)
 	EditPrefs(ctx context.Context, mp *ipn.MaskedPrefs) (*ipn.Prefs, error)
+	CheckSOMarkInUse(ctx context.Context) (bool, error)
 }
 
 // serveEnv is the environment the serve command runs within. All I/O should be
@@ -162,20 +163,21 @@ type serveEnv struct {
 	json bool // output JSON (status only for now)
 
 	// v2 specific flags
-	bg               bgBoolFlag          // background mode
-	setPath          string              // serve path
-	https            uint                // HTTP port
-	http             uint                // HTTP port
-	tcp              uint                // TCP port
-	tlsTerminatedTCP uint                // a TLS terminated TCP port
-	subcmd           serveMode           // subcommand
-	yes              bool                // update without prompt
-	service          tailcfg.ServiceName // service name
-	tun              bool                // redirect traffic to OS for service
-	allServices      bool                // apply config file to all services
+	bg               bgBoolFlag               // background mode
+	setPath          string                   // serve path
+	https            uint                     // HTTP port
+	http             uint                     // HTTP port
+	tcp              uint                     // TCP port
+	tlsTerminatedTCP uint                     // a TLS terminated TCP port
+	proxyProtocol    uint                     // PROXY protocol version (1 or 2)
+	subcmd           serveMode                // subcommand
+	yes              bool                     // update without prompt
+	service          tailcfg.ServiceName      // service name
+	tun              bool                     // redirect traffic to OS for service
+	allServices      bool                     // apply config file to all services
+	acceptAppCaps    []tailcfg.PeerCapability // app capabilities to forward
 
 	lc localServeClient // localClient interface, specific to serve
-
 	// optional stuff for tests:
 	testFlagOut io.Writer
 	testStdout  io.Writer
@@ -570,7 +572,7 @@ func (e *serveEnv) handleTCPServe(ctx context.Context, srcType string, srcPort u
 		return fmt.Errorf("cannot serve TCP; already serving web on %d", srcPort)
 	}
 
-	sc.SetTCPForwarding(srcPort, fwdAddr, terminateTLS, dnsName)
+	sc.SetTCPForwarding(srcPort, fwdAddr, terminateTLS, 0 /* proxy proto */, dnsName)
 
 	if !reflect.DeepEqual(cursc, sc) {
 		if err := e.lc.SetServeConfig(ctx, sc); err != nil {

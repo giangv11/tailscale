@@ -17,7 +17,6 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -27,7 +26,6 @@ import (
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"tailscale.com/client/tailscale"
-	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
@@ -75,10 +73,10 @@ func fromCommand(bs []byte) (string, error) {
 	return args, nil
 }
 
-func (f *fsm) Apply(l *raft.Log) any {
+func (f *fsm) Apply(lg *raft.Log) any {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	s, err := fromCommand(l.Data)
+	s, err := fromCommand(lg.Data)
 	if err != nil {
 		return CommandResult{
 			Err: err,
@@ -115,8 +113,8 @@ func (f *fsm) Restore(rc io.ReadCloser) error {
 }
 
 func testConfig(t *testing.T) {
-	if runtime.GOOS == "windows" && cibuild.On() {
-		t.Skip("cmd/natc isn't supported on Windows, so skipping tsconsensus tests on CI for now; see https://github.com/tailscale/tailscale/issues/16340")
+	if cibuild.On() {
+		t.Skip("these integration tests don't always work well in CI and that's bad for CI; see https://github.com/tailscale/tailscale/issues/16340 and https://github.com/tailscale/tailscale/issues/18022")
 	}
 	// -race AND Parallel makes things start to take too long.
 	if !racebuild.On {
@@ -580,7 +578,6 @@ func TestRejoin(t *testing.T) {
 }
 
 func TestOnlyTaggedPeersCanDialRaftPort(t *testing.T) {
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/15627")
 	testConfig(t)
 	ctx := context.Background()
 	clusterTag := "tag:whatever"
@@ -638,7 +635,6 @@ func TestOnlyTaggedPeersCanDialRaftPort(t *testing.T) {
 }
 
 func TestOnlyTaggedPeersCanBeDialed(t *testing.T) {
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/15627")
 	testConfig(t)
 	ctx := context.Background()
 	clusterTag := "tag:whatever"

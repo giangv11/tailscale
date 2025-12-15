@@ -21,7 +21,6 @@ import (
 	"runtime"
 	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -42,6 +41,7 @@ import (
 	"tailscale.com/net/netx"
 	"tailscale.com/net/tlsdial"
 	"tailscale.com/net/tsdial"
+	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tka"
 	"tailscale.com/tstime"
@@ -72,7 +72,6 @@ type Direct struct {
 	logf                  logger.Logf
 	netMon                *netmon.Monitor // non-nil
 	health                *health.Tracker
-	discoPubKey           key.DiscoPublic
 	busClient             *eventbus.Client
 	clientVersionPub      *eventbus.Publisher[tailcfg.ClientVersion]
 	autoUpdatePub         *eventbus.Publisher[AutoUpdate]
@@ -90,9 +89,10 @@ type Direct struct {
 
 	dialPlan ControlDialPlanner // can be nil
 
-	mu              sync.Mutex        // mutex guards the following fields
+	mu              syncs.Mutex       // mutex guards the following fields
 	serverLegacyKey key.MachinePublic // original ("legacy") nacl crypto_box-based public key; only used for signRegisterRequest on Windows now
 	serverNoiseKey  key.MachinePublic
+	discoPubKey     key.DiscoPublic // protected by mu; can be updated via [SetDiscoPublicKey]
 
 	sfGroup     singleflight.Group[struct{}, *ts2021.Client] // protects noiseClient creation.
 	noiseClient *ts2021.Client                               // also protected by mu
@@ -113,6 +113,9 @@ type Direct struct {
 
 // Observer is implemented by users of the control client (such as LocalBackend)
 // to get notified of changes in the control client's status.
+//
+// If an implementation of Observer also implements [NetmapDeltaUpdater], they get
+// delta updates as well as full netmap updates.
 type Observer interface {
 	// SetControlClientStatus is called when the client has a new status to
 	// report. The Client is provided to allow the Observer to track which
@@ -141,8 +144,17 @@ type Options struct {
 	ControlKnobs         *controlknobs.Knobs // or nil to ignore
 	Bus                  *eventbus.Bus       // non-nil, for setting up publishers
 
+	SkipStartForTests bool // if true, don't call [Auto.Start] to avoid any background goroutines (for tests only)
+
+	// StartPaused indicates whether the client should start in a paused state
+	// where it doesn't do network requests. This primarily exists for testing
+	// but not necessarily "go test" tests, so it isn't restricted to only
+	// being used in tests.
+	StartPaused bool
+
 	// Observer is called when there's a change in status to report
 	// from the control client.
+	// If nil, no status updates are reported.
 	Observer Observer
 
 	// SkipIPForwardingCheck declares that the host's IP
@@ -302,7 +314,6 @@ func NewDirect(opts Options) (*Direct, error) {
 		logf:                  opts.Logf,
 		persist:               opts.Persist.View(),
 		authKey:               opts.AuthKey,
-		discoPubKey:           opts.DiscoPublicKey,
 		debugFlags:            opts.DebugFlags,
 		netMon:                netMon,
 		health:                opts.HealthTracker,
@@ -315,6 +326,7 @@ func NewDirect(opts Options) (*Direct, error) {
 		dnsCache:              dnsCache,
 		dialPlan:              opts.DialPlan,
 	}
+	c.discoPubKey = opts.DiscoPublicKey
 	c.closedCtx, c.closeCtx = context.WithCancel(context.Background())
 
 	c.controlClientID = nextControlClientID.Add(1)
@@ -839,6 +851,14 @@ func (c *Direct) SendUpdate(ctx context.Context) error {
 	return c.sendMapRequest(ctx, false, nil)
 }
 
+// SetDiscoPublicKey updates the disco public key in local state.
+// It does not implicitly trigger [SendUpdate]; callers should arrange for that.
+func (c *Direct) SetDiscoPublicKey(key key.DiscoPublic) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.discoPubKey = key
+}
+
 // ClientID returns the controlClientID of the controlClient.
 func (c *Direct) ClientID() int64 {
 	return c.controlClientID
@@ -888,6 +908,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 	persist := c.persist
 	serverURL := c.serverURL
 	serverNoiseKey := c.serverNoiseKey
+	discoKey := c.discoPubKey
 	hi := c.hostInfoLocked()
 	backendLogID := hi.BackendLogID
 	connectionHandleForTest := c.connectionHandleForTest
@@ -931,11 +952,12 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 	}
 
 	nodeKey := persist.PublicNodeKey()
+
 	request := &tailcfg.MapRequest{
 		Version:                 tailcfg.CurrentCapabilityVersion,
 		KeepAlive:               true,
 		NodeKey:                 nodeKey,
-		DiscoKey:                c.discoPubKey,
+		DiscoKey:                discoKey,
 		Endpoints:               eps,
 		EndpointTypes:           epTypes,
 		Stream:                  isStreaming,
@@ -1059,7 +1081,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 			c.persist = newPersist.View()
 			persist = c.persist
 		}
-		c.expiry = nm.Expiry
+		c.expiry = nm.SelfKeyExpiry()
 	}
 
 	// gotNonKeepAliveMessage is whether we've yet received a MapResponse message without
@@ -1140,7 +1162,19 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 			metricMapResponseKeepAlives.Add(1)
 			continue
 		}
-		if au, ok := resp.DefaultAutoUpdate.Get(); ok {
+
+		// DefaultAutoUpdate in its CapMap and deprecated top-level field forms.
+		if self := resp.Node; self != nil {
+			for _, v := range self.CapMap[tailcfg.NodeAttrDefaultAutoUpdate] {
+				switch v {
+				case "true", "false":
+					c.autoUpdatePub.Publish(AutoUpdate{c.controlClientID, v == "true"})
+				default:
+					c.logf("netmap: [unexpected] unknown %s in CapMap: %q", tailcfg.NodeAttrDefaultAutoUpdate, v)
+				}
+			}
+		}
+		if au, ok := resp.DeprecatedDefaultAutoUpdate.Get(); ok {
 			c.autoUpdatePub.Publish(AutoUpdate{c.controlClientID, au})
 		}
 

@@ -8,8 +8,8 @@ import (
 	"log"
 	"reflect"
 	"slices"
-	"sync"
 
+	"tailscale.com/syncs"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/set"
 )
@@ -34,12 +34,12 @@ type Bus struct {
 	routeDebug hook[RoutedEvent]
 	logf       logger.Logf
 
-	topicsMu sync.Mutex
+	topicsMu syncs.Mutex
 	topics   map[reflect.Type][]*subscribeState
 
 	// Used for introspection/debugging only, not in the normal event
 	// publishing path.
-	clientsMu sync.Mutex
+	clientsMu syncs.Mutex
 	clients   set.Set[*Client]
 }
 
@@ -141,7 +141,7 @@ func (b *Bus) pump(ctx context.Context) {
 		// queue space for it.
 		for !vals.Empty() {
 			val := vals.Peek()
-			dests := b.dest(reflect.ValueOf(val.Event).Type())
+			dests := b.dest(reflect.TypeOf(val.Event))
 
 			if b.routeDebug.active() {
 				clients := make([]*Client, len(dests))
@@ -313,7 +313,7 @@ func (w *worker) StopAndWait() {
 type stopFlag struct {
 	// guards the lazy construction of stopped, and the value of
 	// alreadyStopped.
-	mu             sync.Mutex
+	mu             syncs.Mutex
 	stopped        chan struct{}
 	alreadyStopped bool
 }
