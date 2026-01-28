@@ -13,7 +13,7 @@ import (
 	"runtime"
 	"slices"
 
-	"github.com/tailscale/wireguard-go/tun"
+	"github.com/giangv11/wireguard-go/tun"
 	"tailscale.com/feature"
 	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/health"

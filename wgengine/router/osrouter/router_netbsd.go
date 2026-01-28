@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tailscale/wireguard-go/tun"
+	"github.com/giangv11/wireguard-go/tun"
 	"go4.org/netipx"
 	"tailscale.com/health"
 	"tailscale.com/net/netmon"

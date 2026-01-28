@@ -14,9 +14,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/tailscale/wireguard-go/conn"
-	"github.com/tailscale/wireguard-go/device"
-	"github.com/tailscale/wireguard-go/tun"
+	"github.com/giangv11/wireguard-go/conn"
+	"github.com/giangv11/wireguard-go/device"
+	"github.com/giangv11/wireguard-go/tun"
 	"go4.org/mem"
 	"tailscale.com/types/key"
 )

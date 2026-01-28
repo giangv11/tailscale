@@ -19,8 +19,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/giangv11/wireguard-go/tun"
 	"github.com/tailscale/netlink"
-	"github.com/tailscale/wireguard-go/tun"
 	"go4.org/netipx"
 	"golang.org/x/sys/unix"
 	"golang.org/x/time/rate"

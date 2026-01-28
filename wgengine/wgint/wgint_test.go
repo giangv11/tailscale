@@ -6,7 +6,7 @@ package wgint
 import (
 	"testing"
 
-	"github.com/tailscale/wireguard-go/device"
+	"github.com/giangv11/wireguard-go/device"
 )
 
 func TestInternalOffsets(t *testing.T) {

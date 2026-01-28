@@ -26,10 +26,10 @@ import (
 	"sync"
 	"time"
 
+	wgconn "github.com/giangv11/wireguard-go/conn"
+	"github.com/giangv11/wireguard-go/device"
+	"github.com/giangv11/wireguard-go/tun"
 	"github.com/prometheus/client_golang/prometheus"
-	wgconn "github.com/tailscale/wireguard-go/conn"
-	"github.com/tailscale/wireguard-go/device"
-	"github.com/tailscale/wireguard-go/tun"
 	"go4.org/netipx"
 	"tailscale.com/client/local"
 	"tailscale.com/derp"

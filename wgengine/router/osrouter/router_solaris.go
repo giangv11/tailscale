@@ -6,7 +6,7 @@ package osrouter
 import (
 	"strings"
 
-	"github.com/tailscale/wireguard-go/tun"
+	"github.com/giangv11/wireguard-go/tun"
 	"tailscale.com/health"
 	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"

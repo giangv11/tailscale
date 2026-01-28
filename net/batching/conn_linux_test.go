@@ -9,7 +9,7 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/tailscale/wireguard-go/conn"
+	"github.com/giangv11/wireguard-go/conn"
 	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"
 	"tailscale.com/net/packet"

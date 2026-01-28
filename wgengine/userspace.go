@@ -20,8 +20,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tailscale/wireguard-go/device"
-	"github.com/tailscale/wireguard-go/tun"
+	"github.com/giangv11/wireguard-go/device"
+	"github.com/giangv11/wireguard-go/tun"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/drive"
 	"tailscale.com/envknob"

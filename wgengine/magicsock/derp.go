@@ -15,7 +15,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/tailscale/wireguard-go/conn"
+	"github.com/giangv11/wireguard-go/conn"
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/health"

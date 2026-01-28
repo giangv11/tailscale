@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/tailscale/wireguard-go/device"
+	"github.com/giangv11/wireguard-go/device"
 	"tailscale.com/envknob"
 	"tailscale.com/syncs"
 	"tailscale.com/types/key"

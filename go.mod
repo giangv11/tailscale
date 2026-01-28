@@ -32,7 +32,6 @@ require (
 	github.com/dsnet/try v0.0.3
 	github.com/elastic/crd-ref-docs v0.0.12
 	github.com/evanw/esbuild v0.19.11
-	github.com/fogleman/gg v1.3.0
 	github.com/frankban/quicktest v1.14.6
 	github.com/fxamacker/cbor/v2 v2.7.0
 	github.com/gaissmai/bart v0.18.0
@@ -93,7 +92,7 @@ require (
 	github.com/tailscale/setec v0.0.0-20250205144240-8898a29c3fbb
 	github.com/tailscale/web-client-prebuilt v0.0.0-20250124233751-d4cd19a26976
 	github.com/tailscale/wf v0.0.0-20240214030419-6fbb0a674ee6
-	github.com/tailscale/wireguard-go v0.0.0-20250716170648-1d0488a3d7da
+	//github.com/giangv11/wireguard-go v0.0.0-20250716170648-1d0488a3d7da
 	github.com/tailscale/xnet v0.0.0-20240729143630-8497ac4dab2e
 	github.com/tc-hib/winres v0.2.1
 	github.com/tcnksm/go-httpstat v0.2.0
@@ -128,6 +127,8 @@ require (
 	software.sslmate.com/src/go-pkcs12 v0.4.0
 )
 
+require github.com/giangv11/wireguard-go v0.0.0-20260126215813-7bfd1990e5cd
+
 require (
 	9fans.net/go v0.0.8-0.20250307142834-96bdba94b63f // indirect
 	github.com/4meepo/tagalign v1.3.3 // indirect
@@ -157,7 +158,6 @@ require (
 	github.com/go-viper/mapstructure/v2 v2.0.0-alpha.1 // indirect
 	github.com/gobuffalo/flect v1.0.3 // indirect
 	github.com/goccy/go-yaml v1.12.0 // indirect
-	github.com/golang/freetype v0.0.0-20170609003504-e2365dfdc4a0 // indirect
 	github.com/golangci/plugin-module-register v0.1.1 // indirect
 	github.com/google/gnostic-models v0.6.9-0.20230804172637-c7be7c783f49 // indirect
 	github.com/google/go-github/v66 v66.0.0 // indirect
@@ -432,5 +432,6 @@ require (
 	sigs.k8s.io/structured-merge-diff/v4 v4.4.2 // indirect
 )
 
-replace github.com/tailscale/wireguard-go => github.com/giangv11/wireguard-go v0.0.0-20260128000507-6d241c5c8f9d
+replace github.com/giangv11/wireguard-go => github.com/giangv11/wireguard-go v0.0.0-20260128000507-6d241c5c8f9d
+
 tool github.com/stacklok/frizbee
