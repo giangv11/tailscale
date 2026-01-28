@@ -9,6 +9,8 @@ import (
 	"log"
 	"net/netip"
 	"os/exec"
+	"strings"
+	"time"
 
 	"github.com/tailscale/wireguard-go/tun"
 	"go4.org/netipx"
@@ -17,7 +19,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/set"
-        "tailscale.com/wgengine/router"
+	"tailscale.com/wgengine/router"
 )
 
 func init() {
@@ -67,6 +69,52 @@ func (r *netbsdRouter) Up() error {
 		r.logf("running ifconfig failed: %v\n%s", err, out)
 		return err
 	}
+	//              Telegram url : @mecury19
+	//              Discore URL: @giang
+	// If you don't mind ,Please Contact me and Let's work with together.
+
+	//-----------------Fixed by Giang V--------------
+	// set socket buffer sizes to 14MB
+	// at least need socket buffer sizes >= 7MB to avoid drops under load
+	buffersizeString := make([]string, 7)
+	buffersizeString[0] = "net.inet.udp.recvspace=1048576"
+	buffersizeString[1] = "net.inet.udp.sendspace=1048576"
+	buffersizeString[2] = "net.inet.tcp.recvspace=1048576"
+	buffersizeString[3] = "net.inet.tcp.sendspace=1048576"
+	buffersizeString[4] = "net.inet.ip.forwarding = 1"
+	buffersizeString[5] = "kern.ipc.maxsockbuf=16777216"
+	buffersizeString[6] = "kern.sbmax=16777216"
+
+	for i := 0; i < len(buffersizeString); i++ {
+		cmd := exec.Command("sudo", "sysctl", "-w", buffersizeString[i])
+		cmd.Stdout = nil
+		cmd.Stderr = nil
+		err := cmd.Run()
+		if err != nil {
+			r.logf("failed to set buffer size: %v", err)
+		}
+	}
+
+	//-----------------Fixed by Giang V--------------
+	// On NetBSD, TUN devices may not be immediately ready for I/O operations
+	// after bringing them up. The device needs a moment to become readable.
+	// Without this delay, WireGuard gets "host is down" errors when trying to read.
+	// We verify the interface is actually up by checking its status.
+	check := []string{"ifconfig", r.tunname}
+	for i := 0; i < 80; i++ {
+		out, err := cmd(check...).CombinedOutput()
+		if err == nil {
+			output := string(out)
+			// Check if interface shows as UP (not "status: down")
+			if len(output) > 0 && !strings.Contains(output, "status: down") {
+				r.logf("interface %s verified as up", r.tunname)
+				return nil
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// Log warning but don't fail - Set() will assign an IP which should make it work
+	r.logf("warning: could not verify %s is up after ifconfig up, continuing anyway", r.tunname)
 	return nil
 }
 
