@@ -153,6 +153,7 @@ require (
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/ghostiam/protogetter v0.3.5 // indirect
+	github.com/giangv11/wireguard-go v0.0.0-20260126215813-7bfd1990e5cd // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-viper/mapstructure/v2 v2.0.0-alpha.1 // indirect
 	github.com/gobuffalo/flect v1.0.3 // indirect
@@ -433,4 +434,5 @@ require (
 )
 
 replace github.com/tailscale/wireguard-go => github.com/giangv11/wireguard-go v0.0.0-20260128000507-6d241c5c8f9d
+
 tool github.com/stacklok/frizbee
