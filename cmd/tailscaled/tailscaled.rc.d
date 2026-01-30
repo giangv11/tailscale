@@ -12,7 +12,6 @@ rcvar=${name}
 command="/usr/sbin/tailscaled"
 command_args="--state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock"
 pidfile="/var/run/tailscale/${name}.pid"
-required_dirs="/var/lib/tailscale /var/run/tailscale"
 start_precmd="tailscaled_prestart"
 stop_postcmd="tailscaled_poststop"
 

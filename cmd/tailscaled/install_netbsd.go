@@ -37,13 +37,12 @@ rcvar=${name}
 command="/usr/sbin/tailscaled"
 command_args="--state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock"
 pidfile="/var/run/tailscale/${name}.pid"
-required_dirs="/var/lib/tailscale /var/run/tailscale"
 start_precmd="tailscaled_prestart"
 stop_postcmd="tailscaled_poststop"
 
 tailscaled_prestart()
 {
-	# Create required directories
+	# Create required directories (must be done before rc.subr checks)
 	mkdir -p /var/lib/tailscale
 	mkdir -p /var/run/tailscale
 	chmod 700 /var/lib/tailscale
@@ -121,6 +120,14 @@ func installSystemDaemonNetBSD(args []string) (err error) {
 		if err := copyBinary(exe, targetBin); err != nil {
 			return err
 		}
+	}
+
+	// Create required directories before installing the script
+	if err := os.MkdirAll("/var/lib/tailscale", 0700); err != nil {
+		return fmt.Errorf("failed to create /var/lib/tailscale: %w", err)
+	}
+	if err := os.MkdirAll("/var/run/tailscale", 0755); err != nil {
+		return fmt.Errorf("failed to create /var/run/tailscale: %w", err)
 	}
 
 	// Write the rc.d script
@@ -226,6 +233,9 @@ func addToRcConf(rcConfPath, line string) error {
 func removeFromRcConf(rcConfPath, serviceName string) error {
 	data, err := os.ReadFile(rcConfPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // File doesn't exist, nothing to remove
+		}
 		return err
 	}
 
@@ -239,5 +249,11 @@ func removeFromRcConf(rcConfPath, serviceName string) error {
 		}
 	}
 
-	return os.WriteFile(rcConfPath, []byte(strings.Join(newLines, "\n")), 0644)
+	// Preserve the original file ending (newline or not)
+	content := strings.Join(newLines, "\n")
+	if len(data) > 0 && data[len(data)-1] == '\n' && !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+
+	return os.WriteFile(rcConfPath, []byte(content), 0644)
 }
