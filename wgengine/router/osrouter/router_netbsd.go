@@ -97,18 +97,16 @@ func (r *netbsdRouter) Up() error {
 		r.logf("Successfully set buffer size on NetBSD %s", buffersizeString[i])
 	}
 
-	// Default tun devcie inet config after ifconfig up (Initailze)
+	// Default tun device inet config after ifconfig up (Initialize)
 	// After running the above sysctl commands, we need to set the inet config again
-	//After running Daemon with sudo privileges, the tun device inet config will be reset
-	inet_String := ("sudo ifconfig tun0 inet 100.64.0.1/32 up")
-	cmd_inet := exec.Command(inet_String)
-	cmd_inet.Stdout = nil
-	cmd_inet.Stderr = nil
-	err := cmd_inet.Run()
-	if err != nil {
-		r.logf("failed to set inet initilalize: %v", err)
+	// After running Daemon with sudo privileges, the tun device inet config will be reset
+	// Reconfigure the interface using the same method as initial setup
+	ifinet := []string{"ifconfig", r.tunname, "inet", "100.64.0.1/32", "up"}
+	if out, err := cmd(ifinet...).CombinedOutput(); err != nil {
+		r.logf("failed to reinitialize inet config after sysctl: %v\n%s", err, out)
+	} else {
+		r.logf("Successfully reinitialized inet config on NetBSD for %s", r.tunname)
 	}
-	// r.logf("Successfully set inet initilalize on NetBSD %s", inet_String)
 
 	//-----------------Fixed by Giang V--------------
 	// On NetBSD, TUN devices may not be immediately ready for I/O operations
