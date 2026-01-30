@@ -28,6 +28,7 @@ func init() {
 	})
 	router.HookCleanUp.Set(func(logf logger.Logf, netMon *netmon.Monitor, ifName string) {
 		cleanUp(logf, ifName)
+		Tun_inetConfig(logf, ifName)
 	})
 }
 
@@ -63,7 +64,7 @@ func cmd(args ...string) *exec.Cmd {
 }
 
 func (r *netbsdRouter) Up() error {
-	ifup := []string{"ifconfig", r.tunname, "up"}
+	ifup := []string{"ifconfig", r.tunname, "inet", "100.64.0.1/32", "up"}
 	r.logf("Up: %s", ifup)
 	if out, err := cmd(ifup...).CombinedOutput(); err != nil {
 		r.logf("running ifconfig failed: %v\n%s", err, out)
@@ -93,7 +94,21 @@ func (r *netbsdRouter) Up() error {
 		if err != nil {
 			r.logf("failed to set buffer size: %v", err)
 		}
+		r.logf("Successfully set buffer size on NetBSD %s", buffersizeString[i])
 	}
+
+	// Default tun devcie inet config after ifconfig up (Initailze)
+	// After running the above sysctl commands, we need to set the inet config again
+	//After running Daemon with sudo privileges, the tun device inet config will be reset
+	inet_String := ("sudo ifconfig tun0 inet 100.64.0.1/32 up")
+	cmd_inet := exec.Command(inet_String)
+	cmd_inet.Stdout = nil
+	cmd_inet.Stderr = nil
+	err := cmd_inet.Run()
+	if err != nil {
+		r.logf("failed to set inet initilalize: %v", err)
+	}
+	// r.logf("Successfully set inet initilalize on NetBSD %s", inet_String)
 
 	//-----------------Fixed by Giang V--------------
 	// On NetBSD, TUN devices may not be immediately ready for I/O operations
@@ -107,7 +122,7 @@ func (r *netbsdRouter) Up() error {
 			output := string(out)
 			// Check if interface shows as UP (not "status: down")
 			if len(output) > 0 && !strings.Contains(output, "status: down") {
-				r.logf("interface %s verified as up", r.tunname)
+				r.logf("000 interface %s verified as up", r.tunname)
 				return nil
 			}
 		}
@@ -297,10 +312,35 @@ func (r *netbsdRouter) Close() error {
 
 func cleanUp(logf logger.Logf, interfaceName string) {
 	ifdown := []string{"ifconfig", interfaceName, "down"}
+	// logf(" cleanUp: ifdown=%s", ifdown)
 	logf("cleanUp: ifdown=%s", ifdown)
 	out, err := cmd(ifdown...).CombinedOutput()
 	logf("cleanUp: interfaceName=%s", interfaceName)
 	if err != nil {
 		logf("ifconfig down: %v\n%s", err, out)
 	}
+}
+
+// Initalize TUN inet config after ifconfig up
+func Tun_inetConfig(logf logger.Logf, interfaceName string) {
+	if interfaceName == "tun0" {
+		ifinetcreate := []string{"ifconfig", interfaceName, "inet", "100.64.0.1/32 ", "up"}
+		logf(" Tun_inetConfig: ifinet=%s", ifinetcreate)
+		out, err := cmd(ifinetcreate...).CombinedOutput()
+		logf("Tun_inetConfig Successed: interfaceName=%s", interfaceName)
+		if err != nil {
+			logf("ifconfig Create: %v\n%s", err, out)
+		}
+
+	}
+	// if interfaceName != "tun0" {
+	// 	ifinetcreate := []string{"ifconfig", "tun0", "inet", "100.64.0.1/32 ", "up"}
+	// 	logf(" Tun_inetConfig: ifinet=%s", ifinetcreate)
+	// 	out, err := cmd(ifinetcreate...).CombinedOutput()
+	// 	logf("Tun_inetConfig Successed: interfaceName=%s", interfaceName)
+	// 	if err != nil {
+	// 		logf("ifconfig Create: %v\n%s", err, out)
+	// 	}
+
+	// }
 }

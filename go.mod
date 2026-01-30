@@ -127,7 +127,10 @@ require (
 	software.sslmate.com/src/go-pkcs12 v0.4.0
 )
 
-require github.com/giangv11/wireguard-go v0.0.0-20260126215813-7bfd1990e5cd
+require (
+	github.com/fogleman/gg v1.3.0
+	github.com/giangv11/wireguard-go v0.0.0-20260126215813-7bfd1990e5cd
+)
 
 require (
 	9fans.net/go v0.0.8-0.20250307142834-96bdba94b63f // indirect
@@ -158,6 +161,7 @@ require (
 	github.com/go-viper/mapstructure/v2 v2.0.0-alpha.1 // indirect
 	github.com/gobuffalo/flect v1.0.3 // indirect
 	github.com/goccy/go-yaml v1.12.0 // indirect
+	github.com/golang/freetype v0.0.0-20170609003504-e2365dfdc4a0 // indirect
 	github.com/golangci/plugin-module-register v0.1.1 // indirect
 	github.com/google/gnostic-models v0.6.9-0.20230804172637-c7be7c783f49 // indirect
 	github.com/google/go-github/v66 v66.0.0 // indirect
